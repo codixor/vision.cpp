@@ -12,6 +12,7 @@ option(VISP_INSTALL_MODELS "Download and install default models" ${VISP_PACKAGE}
 option(VISP_FMT_LIB "Use external fmt library instead of standard C++ <format>" OFF)
 option(VISP_STATIC_GGML "Force static build of ggml" OFF)
 option(VISP_ASAN "Enable AddressSanitizer" OFF)
+option(VISP_SHARED_GGML "Build on depend/ggml-shared (audio.cpp ggml + vision ops) so whisper.cpp and audio.cpp can link the same ggml" OFF)
 
 include(GNUInstallDirs)
 set(VISP_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header files")
@@ -136,7 +137,11 @@ if(VISP_CI)
     endforeach()
   endif()
 endif()
-add_subdirectory(depend/llama/ggml)
+if(VISP_SHARED_GGML)
+  add_subdirectory(depend/ggml-shared)
+else()
+  add_subdirectory(depend/llama/ggml)
+endif()
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 
 # Vision.cpp libraries and executables
