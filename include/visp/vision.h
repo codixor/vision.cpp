@@ -89,6 +89,7 @@ enum class model_family {
     depth_anything,
     migan,
     esrgan,
+    clip,
 
     count
 };
@@ -219,6 +220,43 @@ VISP_API image_data birefnet_process_output(
 VISP_API tensor birefnet_predict(model_ref, tensor image, birefnet_params const&);
 
 //
+// CLIP vision - image embeddings (IP-Adapter, Wan/Hunyuan image conditioning, unCLIP)
+
+struct clip_model;
+
+struct clip_params {
+    int image_size = 224;
+    int patch_size = 14;
+    int embed_dim = 1280;
+    int n_heads = 16;
+    int n_layers = 32;
+    int projection_dim = 1024;
+    bool quick_gelu = false;
+    float eps = 1e-5f;
+};
+
+struct clip_output {
+    tensor image_embeds = nullptr; // [projection_dim, batch]
+    tensor penultimate = nullptr;  // [embed_dim, n_patches + 1, batch], second-to-last layer
+};
+
+struct clip_result {
+    std::vector<float> image_embeds;
+    std::vector<float> penultimate;
+    int n_tokens = 0;
+};
+
+// Loads a CLIP vision model (ViT + projection) from GGUF file onto the backend device.
+VISP_API clip_model clip_load_model(char const* filepath, backend_device const&);
+
+// Computes the projected image embedding and the penultimate hidden states.
+VISP_API clip_result clip_compute(clip_model&, image_view image);
+
+VISP_API clip_params clip_detect_params(model_file const&);
+VISP_API image_data clip_process_input(image_view image, clip_params const&);
+VISP_API clip_output clip_encode(model_ref, tensor image, clip_params const&);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -333,6 +371,17 @@ struct birefnet_model {
     compute_graph graph;
     tensor input = nullptr;
     tensor output = nullptr;
+};
+
+// internal
+struct clip_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    clip_params params;
+
+    compute_graph graph;
+    tensor input = nullptr;
+    clip_output output;
 };
 
 // internal

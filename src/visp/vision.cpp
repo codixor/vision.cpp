@@ -16,6 +16,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::migan;
     } else if (arch == "esrgan") {
         return model_family::esrgan;
+    } else if (arch == "clip") {
+        return model_family::clip;
     }
     return model_family::count;
 }
@@ -164,6 +166,41 @@ image_data depthany_compute(depthany_model& model, image_view image) {
 
     tensor_data output_data = transfer_from_backend(model.output);
     return depthany_process_output(output_data.as_f32(), image.extent, model.params);
+}
+
+//
+// CLIP vision
+
+clip_model clip_load_model(char const* filepath, backend_device const& dev) {
+    clip_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = clip_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    return model;
+}
+
+clip_result clip_compute(clip_model& model, image_view image) {
+    int const s = model.params.image_size;
+    if (!model.graph) {
+        model.graph = compute_graph_init();
+        model_ref m(model.weights, model.graph);
+        model.input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+        model.output = clip_encode(m, model.input, model.params);
+        compute_graph_allocate(model.graph, *model.backend);
+    }
+    image_data img_data = clip_process_input(image, model.params);
+    transfer_to_backend(model.input, img_data);
+    compute(model.graph, *model.backend);
+
+    clip_result r;
+    tensor_data embeds = transfer_from_backend(model.output.image_embeds);
+    tensor_data hidden = transfer_from_backend(model.output.penultimate);
+    r.image_embeds.assign(embeds.as_f32().begin(), embeds.as_f32().end());
+    r.penultimate.assign(hidden.as_f32().begin(), hidden.as_f32().end());
+    r.n_tokens = int(model.output.penultimate->ne[1]);
+    return r;
 }
 
 //

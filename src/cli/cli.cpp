@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -41,6 +41,7 @@ Commands:
     depthany  - Depth-Anything depth estimation
     migan     - MI-GAN inpainting
     esrgan    - ESRGAN/Real-ESRGAN upscaling
+    clip      - CLIP vision image embedding (writes floats as text)
 
 Options:
     -i, --input <image1> [<image2> ...]  Input image(s)
@@ -126,6 +127,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::migan;
     } else if (arg1 == "esrgan") {
         r.command = cli_command::esrgan;
+    } else if (arg1 == "clip") {
+        r.command = cli_command::clip;
     } else if (arg1 == "-h" || arg1 == "--help") {
         print_usage();
     } else {
@@ -168,6 +171,7 @@ void run_birefnet(cli_args const&);
 void run_depth_anything(cli_args const&);
 void run_migan(cli_args const&);
 void run_esrgan(cli_args const&);
+void run_clip(cli_args const&);
 
 } // namespace visp
 
@@ -186,6 +190,7 @@ int main(int argc, char** argv) {
             case cli_command::depth_anything: run_depth_anything(args); break;
             case cli_command::migan: run_migan(args); break;
             case cli_command::esrgan: run_esrgan(args); break;
+            case cli_command::clip: run_clip(args); break;
             case cli_command::none: break;
         }
 
@@ -482,6 +487,44 @@ void run_birefnet(cli_args const& args) {
     printf("-> mask saved to %s\n", args.output);
 
     composite_image_with_mask(image, mask_resized, args.composite);
+}
+
+//
+// CLIP vision
+
+void run_clip(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] = load_model_weights(
+        args, backend, "CLIP-ViT-H-14-F16.gguf", 0, backend.preferred_layout());
+
+    require_inputs(args.inputs, 1, "<image>");
+    image_data image = image_load(args.inputs[0]);
+    clip_params params = clip_detect_params(file);
+    image_data input_data = clip_process_input(image, params);
+    printf("- image size: %d, layers: %d, embed: %d -> %d\n", params.image_size,
+        params.n_layers, params.embed_dim, params.projection_dim);
+
+    compute_graph graph = compute_graph_init();
+    model_ref m(weights, graph);
+    print_model_flags(m);
+    int const s = params.image_size;
+    tensor input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+    clip_output output = clip_encode(m, input, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input, input_data);
+    compute_timed(graph, backend);
+
+    tensor_data embeds = transfer_from_backend(output.image_embeds);
+    FILE* f = fopen(args.output, "w");
+    if (!f) {
+        throw except("Cannot write {}", args.output);
+    }
+    for (float v : embeds.as_f32()) {
+        fprintf(f, "%.7g\n", v);
+    }
+    fclose(f);
+    printf("-> %d floats saved to %s\n", int(embeds.as_f32().size()), args.output);
 }
 
 //
