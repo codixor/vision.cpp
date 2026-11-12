@@ -316,13 +316,21 @@ int64_t max_tensor_elements(ggml_context* ctx) {
     return result;
 }
 
-ggml_type detect_float_type(ggml_context* ctx) {
+ggml_type detect_float_type(ggml_context* ctx, ggml_type target = GGML_TYPE_COUNT) {
+    // Prefer a float type that differs from `target`: models can mix F32 and F16
+    // tensors, and conversion is needed if any tensor differs from the target.
+    ggml_type first = GGML_TYPE_COUNT;
     for (ggml_tensor* t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
         if (is_float_type(t->type)) {
-            return t->type;
+            if (first == GGML_TYPE_COUNT) {
+                first = t->type;
+            }
+            if (target != GGML_TYPE_COUNT && t->type != target) {
+                return t->type;
+            }
         }
     }
-    return GGML_TYPE_F32;
+    return first == GGML_TYPE_COUNT ? GGML_TYPE_F32 : first;
 }
 
 template <typename T>
@@ -352,7 +360,7 @@ struct tensor_converter {
         if (dst_type == GGML_TYPE_COUNT && !whcn_to_cwhn) {
             return;
         }
-        src_type = detect_float_type(weights);
+        src_type = detect_float_type(weights, dst_type);
         if (src_type == dst_type && !whcn_to_cwhn) {
             return;
         }
