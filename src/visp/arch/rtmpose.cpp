@@ -47,7 +47,7 @@ tensor cspnext_block(model_ref m, tensor x, bool identity) {
 
 // x * hardsigmoid(fc(mean_hw(x)))
 tensor channel_attention(model_ref m, tensor x) {
-    tensor pooled;
+    tensor pooled = nullptr;
     if (is_cwhn(m)) { // [C, W, H, N] -> mean over W*H
         auto [c, w, h, n] = nelements(x);
         tensor t = ggml_reshape_3d(m, x, c, w * h, n);
@@ -188,9 +188,18 @@ rtmpose_params rtmpose_detect_params(model_file const& f) {
     p.gau_e = f.get_int("rtmpose.gau_e");
     f.get_array("rtmpose.stage_depths", span<int>(p.stage_depths.data(), 4));
     if (p.input_width < 32 || p.input_height < 32 || p.input_width % 32 || p.input_height % 32 ||
-        p.num_keypoints < 1 || p.num_keypoints > 1024) {
+        p.input_width > 4096 || p.input_height > 4096 || p.num_keypoints < 1 ||
+        p.num_keypoints > 1024) {
         throw except("RTMPose: invalid input {}x{} or keypoints {}", p.input_width,
                      p.input_height, p.num_keypoints);
+    }
+    bool depths_ok = true;
+    for (int d : p.stage_depths) {
+        depths_ok = depths_ok && d >= 0 && d <= 32;
+    }
+    if (p.final_kernel < 1 || p.final_kernel % 2 == 0 || p.final_kernel > 31 || p.gau_s < 1 ||
+        p.gau_e < 1 || !depths_ok) {
+        throw except("RTMPose: invalid head/backbone metadata ({})", f.path);
     }
     return p;
 }
@@ -200,6 +209,17 @@ rtmpose_params rtmpose_detect_params(model_file const& f) {
 image_data rtmpose_process_input(
     image_view image, std::array<float, 4> box, rtmpose_params const& p, rtmpose_crop* crop) {
     int const W = p.input_width, H = p.input_height;
+    if (image.extent[0] < 1 || image.extent[1] < 1) {
+        throw except("RTMPose: empty image");
+    }
+    for (float v : box) {
+        if (!std::isfinite(v)) {
+            throw except("RTMPose: person box must be finite");
+        }
+    }
+    if (!(box[2] > box[0] && box[3] > box[1])) {
+        throw except("RTMPose: person box must have x1 > x0 and y1 > y0");
+    }
     float cx = (box[0] + box[2]) * 0.5f, cy = (box[1] + box[3]) * 0.5f;
     float bw = (box[2] - box[0]) * 1.25f, bh = (box[3] - box[1]) * 1.25f;
     float aspect = float(W) / float(H);
@@ -245,7 +265,7 @@ image_data rtmpose_process_input(
 std::vector<rtmpose_keypoint> rtmpose_decode(
     span<float const> simcc, rtmpose_params const& p, rtmpose_crop const& crop) {
     int const nx = p.input_width * 2, ny = p.input_height * 2;
-    size_t const row = size_t(nx + ny);
+    size_t const row = size_t(nx) + size_t(ny);
     std::vector<rtmpose_keypoint> kps;
     if (simcc.size() < row * p.num_keypoints) {
         return kps;

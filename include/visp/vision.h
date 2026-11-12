@@ -579,6 +579,7 @@ struct raft_model {
 
     compute_graph graph;
     i32x2 extent{};
+    int iterations = 0; // value the cached graph was built with
     tensor input0 = nullptr;
     tensor input1 = nullptr;
     tensor output = nullptr;

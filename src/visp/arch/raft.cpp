@@ -188,6 +188,9 @@ tensor raft_flow(model_ref m, tensor image0, tensor image1, raft_params const& p
     span<tensor const> levels(pyramid.data(), size_t(p.corr_levels));
 
     tensor ctx = encoder(m["context_encoder"], img0, false);
+    if (p.hidden_size >= ctx->ne[2]) {
+        throw except("RAFT: hidden size {} exceeds context channels {}", p.hidden_size, ctx->ne[2]);
+    }
     tensor hidden = ggml_tanh(m, channels(m, ctx, 0, p.hidden_size));
     tensor context = ggml_relu(m, channels(m, ctx, p.hidden_size, ctx->ne[2] - p.hidden_size));
 
@@ -235,8 +238,12 @@ raft_params raft_detect_params(model_file const& f) {
     p.hidden_size = f.get_int("raft.hidden_size");
     p.corr_levels = f.get_int("raft.corr_levels");
     p.corr_radius = f.get_int("raft.corr_radius");
-    if (p.corr_levels < 1 || p.corr_levels > 8 || p.corr_radius < 1 || p.corr_radius > 8) {
+    // 5 levels is the most a 1/8 map of the minimum 128 px input can pool without degenerating.
+    if (p.corr_levels < 1 || p.corr_levels > 5 || p.corr_radius < 1 || p.corr_radius > 8) {
         throw except("RAFT: unsupported pyramid {} levels / radius {}", p.corr_levels, p.corr_radius);
+    }
+    if (p.hidden_size < 1 || p.hidden_size > 1024) {
+        throw except("RAFT: invalid hidden size {} ({})", p.hidden_size, f.path);
     }
     if (gguf_find_tensor(f.gguf.get(), "mask_predictor.conv.weight") < 0) {
         throw except("RAFT: only raft_large (with mask predictor) is supported ({})", f.path);

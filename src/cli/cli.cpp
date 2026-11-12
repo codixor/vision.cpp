@@ -729,7 +729,11 @@ void run_pose(cli_args const& args) {
     }
     std::array<float, 4> box;
     for (int i = 0; i < 4; ++i) {
-        box[i] = std::strtof(args.prompt[i], nullptr);
+        char* end = nullptr;
+        box[i] = std::strtof(args.prompt[i], &end);
+        if (end == args.prompt[i] || *end != '\0') {
+            throw except("pose: box coordinate '{}' is not a number", args.prompt[i]);
+        }
     }
     image_data image = image_load(args.inputs[0]);
     rtmpose_params params = rtmpose_detect_params(file);
@@ -796,7 +800,14 @@ void run_rife(cli_args const& args) {
     auto [file, weights] =
         load_model_weights(args, backend, "RIFE-4.25-F16.gguf", 0, tensor_data_layout::whcn);
     rife_params params = rife_detect_params(file);
-    float t = args.prompt.empty() ? 0.5f : std::strtof(args.prompt[0], nullptr);
+    float t = 0.5f;
+    if (!args.prompt.empty()) {
+        char* end = nullptr;
+        t = std::strtof(args.prompt[0], &end);
+        if (end == args.prompt[0] || *end != '\0') {
+            throw except("RIFE: timestep '{}' is not a number", args.prompt[0]);
+        }
+    }
     if (!(t > 0.f && t < 1.f)) {
         throw except("RIFE: timestep must be in (0, 1), got {}", t);
     }
@@ -841,7 +852,12 @@ void run_flow(cli_args const& args) {
     char const* path = args.model ? args.model : "models/RAFT-L-F16.gguf";
     raft_model model = raft_load_model(path, backend);
     if (!args.prompt.empty()) {
-        model.params.iterations = std::max(1, int(std::strtol(args.prompt[0], nullptr, 10)));
+        char* end = nullptr;
+        long n = std::strtol(args.prompt[0], &end, 10);
+        if (end == args.prompt[0] || *end != '\0' || n < 1 || n > 64) {
+            throw except("flow: iterations must be an integer in 1..64, got '{}'", args.prompt[0]);
+        }
+        model.params.iterations = int(n);
     }
     require_inputs(args.inputs, 2, "<frame0> <frame1>");
     image_data frame0 = image_load(args.inputs[0]);
@@ -869,13 +885,15 @@ void run_flow(cli_args const& args) {
         }
         float const tag = 202021.25f;
         int32_t const wh[2] = {flow.extent[0], flow.extent[1]};
-        std::fwrite(&tag, 4, 1, f);
-        std::fwrite(wh, 4, 2, f);
-        for (size_t i = 0; i < flow.u.size(); ++i) {
+        bool ok = std::fwrite(&tag, 4, 1, f) == 1 && std::fwrite(wh, 4, 2, f) == 2;
+        for (size_t i = 0; ok && i < flow.u.size(); ++i) {
             float uv[2] = {flow.u[i], flow.v[i]};
-            std::fwrite(uv, 4, 2, f);
+            ok = std::fwrite(uv, 4, 2, f) == 2;
         }
-        std::fclose(f);
+        ok = (std::fclose(f) == 0) && ok;
+        if (!ok) {
+            throw except("Failed to write {}", args.output);
+        }
     } else {
         image_save(raft_flow_to_image(flow), args.output);
     }

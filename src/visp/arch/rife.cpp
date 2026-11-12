@@ -125,8 +125,9 @@ tensor if_block(model_ref m, tensor x, tensor flow, int scale) {
 
 tensor rife_interpolate(model_ref m, tensor image0, tensor image1, float t, rife_params const& p) {
     using namespace rife;
-    tensor img0 = ggml_clamp(m, cwhn_to_contiguous_2d(m, image0), 0.f, 1.f);
-    tensor img1 = ggml_clamp(m, cwhn_to_contiguous_2d(m, image1), 0.f, 1.f);
+    // ggml_clamp works in place: dup first so a pass-through layout never clamps the graph input.
+    tensor img0 = ggml_clamp(m, ggml_dup(m, cwhn_to_contiguous_2d(m, image0)), 0.f, 1.f);
+    tensor img1 = ggml_clamp(m, ggml_dup(m, cwhn_to_contiguous_2d(m, image1)), 0.f, 1.f);
     tensor f0 = encode(m["encode"], img0);
     tensor f1 = encode(m["encode"], img1);
     tensor timestep = ggml_scale_bias(m, channels(m, img0, 0, 1), 0.f, t);
@@ -143,7 +144,7 @@ tensor rife_interpolate(model_ref m, tensor image0, tensor image1, float t, rife
     for (int i = 0; i < p.num_blocks; ++i) {
         int scale = 1 << (p.num_blocks - 1 - i); // 16, 8, 4, 2, 1
         model_ref block = m[format<fixed_string<16>>("block{}", i).c_str()];
-        tensor out;
+        tensor out = nullptr;
         if (!flow) {
             out = if_block(block, cat({img0, img1, f0, f1, timestep}), nullptr, scale);
             flow = channels(m, out, 0, 4);

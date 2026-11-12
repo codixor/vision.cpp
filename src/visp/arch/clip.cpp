@@ -1,5 +1,6 @@
 #include "visp/arch/clip.h"
 #include "util/math.h"
+#include "util/string.h"
 #include "visp/ml.h"
 #include "visp/nn.h"
 
@@ -95,6 +96,13 @@ clip_params clip_detect_params(model_file const& file) {
     p.n_layers = file.get_int("clip.n_layers");
     p.projection_dim = file.get_int("clip.projection_dim");
     p.quick_gelu = file.get_int("clip.quick_gelu") != 0;
+    // Metadata comes from an untrusted file: reject values that would divide by zero,
+    // leave the penultimate layer unset or size the graph absurdly.
+    if (p.patch_size < 1 || p.image_size < p.patch_size || p.image_size > 4096 ||
+        p.image_size % p.patch_size || p.n_heads < 1 || p.embed_dim < p.n_heads ||
+        p.embed_dim % p.n_heads || p.n_layers < 2 || p.n_layers > 256 || p.projection_dim < 1) {
+        throw except("CLIP: invalid model metadata ({})", file.path);
+    }
     return p;
 }
 
@@ -103,6 +111,9 @@ image_data clip_process_input(image_view image, clip_params const& p) {
     constexpr f32x4 mean = f32x4{0.48145466f, 0.4578275f, 0.40821073f, 0.f};
     constexpr f32x4 std = f32x4{0.26862954f, 0.26130258f, 0.27577711f, 1.f};
     int const s = p.image_size;
+    if (image.extent[0] < 1 || image.extent[1] < 1) {
+        throw except("CLIP: empty image");
+    }
     float const k = float(s) / float(std::min(image.extent[0], image.extent[1]));
     i32x2 scaled = {
         std::max(s, int(std::lround(image.extent[0] * k))),

@@ -151,7 +151,7 @@ gfpgan_params gfpgan_detect_params(model_file const& f) {
     p.style_dim = f.get_int("gfpgan.style_dim");
     p.num_latent = f.get_int("gfpgan.num_latent");
     if (p.image_size < 64 || p.image_size > 1024 || (p.image_size & (p.image_size - 1)) ||
-        p.num_latent != p.levels() * 2 + 2) {
+        p.num_latent != p.levels() * 2 + 2 || p.style_dim < 1 || p.style_dim > 4096) {
         throw except("GFPGAN: unsupported size {} / latents {}", p.image_size, p.num_latent);
     }
     return p;

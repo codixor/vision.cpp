@@ -289,6 +289,9 @@ image_data gfpgan_compute(gfpgan_model& model, image_view face) {
         model.output = gfpgan_restore(m, model.input, model.params);
         compute_graph_allocate(model.graph, *model.backend);
     }
+    if (face.extent[0] < 1 || face.extent[1] < 1) {
+        throw except("GFPGAN: empty image");
+    }
     image_data resized;
     if (face.extent != i32x2{s, s}) {
         resized = image_scale(face, {s, s});
@@ -337,6 +340,13 @@ image_data rife_compute(rife_model& model, image_view frame0, image_view frame1,
     if (frame0.extent != frame1.extent) {
         throw except("RIFE: frames must have the same size");
     }
+    if (frame0.extent[0] < 1 || frame0.extent[1] < 1) {
+        throw except("RIFE: empty frame");
+    }
+    // warp gathers use float-encoded pixel indices, exact only below 2^24 (e.g. 4096x4096)
+    if (int64_t(frame0.extent[0]) * frame0.extent[1] > (int64_t(1) << 24)) {
+        throw except("RIFE: frames larger than 16.7 megapixels are not supported");
+    }
     image_data in0 = rife_process_input(frame0);
     image_data in1 = rife_process_input(frame1);
     if (!model.graph || model.extent != in0.extent || model.t != t) {
@@ -383,9 +393,21 @@ raft_flow_field raft_compute(raft_model& model, image_view frame0, image_view fr
     if (frame0.extent != frame1.extent) {
         throw except("RAFT: frames must have the same size");
     }
+    if (frame0.extent[0] < 1 || frame0.extent[1] < 1) {
+        throw except("RAFT: empty frame");
+    }
+    if (model.params.iterations < 1 || model.params.iterations > 64) {
+        throw except("RAFT: iterations must be in 1..64, got {}", model.params.iterations);
+    }
     int const a = raft_params::alignment;
     i32x2 const size{std::max(128, (frame0.extent[0] + a - 1) / a * a),
                      std::max(128, (frame0.extent[1] + a - 1) / a * a)};
+    // all-pairs correlation volume: (W/8 * H/8)^2 floats at full resolution
+    double const corr_gib = std::pow(double(size[0] / 8) * double(size[1] / 8), 2.0) * 4.0 / 1073741824.0;
+    if (corr_gib > 8.0) {
+        throw except("RAFT: {}x{} needs a {:.1f} GiB correlation volume; downscale the frames",
+                     frame0.extent[0], frame0.extent[1], corr_gib);
+    }
     auto prepare = [&](image_view frame) {
         image_data f = image_u8_to_f32(frame, image_format::rgb_f32);
         if (size == frame.extent) {
@@ -403,7 +425,7 @@ raft_flow_field raft_compute(raft_model& model, image_view frame0, image_view fr
     };
     image_data in0 = prepare(frame0);
     image_data in1 = prepare(frame1);
-    if (!model.graph || model.extent != size) {
+    if (!model.graph || model.extent != size || model.iterations != model.params.iterations) {
         model.graph = compute_graph_init(16384);
         model_ref m(model.weights, model.graph);
         model.input0 = compute_graph_input(m, GGML_TYPE_F32, {3, size[0], size[1], 1});
@@ -411,6 +433,7 @@ raft_flow_field raft_compute(raft_model& model, image_view frame0, image_view fr
         model.output = raft_flow(m, model.input0, model.input1, model.params);
         compute_graph_allocate(model.graph, *model.backend);
         model.extent = size;
+        model.iterations = model.params.iterations;
     }
     transfer_to_backend(model.input0, in0);
     transfer_to_backend(model.input1, in1);
@@ -454,7 +477,10 @@ image_data raft_flow_to_image(raft_flow_field const& f, float max_flow) {
     size_t const n = f.u.size();
     if (max_flow <= 0.f) {
         for (size_t i = 0; i < n; ++i) {
-            max_flow = std::max(max_flow, std::sqrt(f.u[i] * f.u[i] + f.v[i] * f.v[i]));
+            float m = std::sqrt(f.u[i] * f.u[i] + f.v[i] * f.v[i]);
+            if (std::isfinite(m)) {
+                max_flow = std::max(max_flow, m);
+            }
         }
         max_flow = std::max(max_flow, 1e-5f);
     }
@@ -462,10 +488,13 @@ image_data raft_flow_to_image(raft_flow_field const& f, float max_flow) {
     uint8_t* px = out.data.get();
     for (size_t i = 0; i < n; ++i) {
         float u = f.u[i] / max_flow, v = f.v[i] / max_flow;
+        if (!std::isfinite(u) || !std::isfinite(v)) {
+            u = v = 0.f; // undefined motion is drawn white
+        }
         float rad = std::min(1.f, std::sqrt(u * u + v * v));
         float a = std::atan2(-v, -u) / 3.14159265f;
         float fk = (a + 1.f) / 2.f * float(ncols - 1);
-        int k0 = int(std::floor(fk)), k1 = (k0 + 1) % ncols;
+        int k0 = std::clamp(int(std::floor(fk)), 0, ncols - 1), k1 = (k0 + 1) % ncols;
         float t = fk - float(k0);
         for (int c = 0; c < 3; ++c) {
             float col = ((1.f - t) * wheel[k0][c] + t * wheel[k1][c]) / 255.f;

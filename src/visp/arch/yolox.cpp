@@ -146,6 +146,12 @@ image_data yolox_process_input(image_view image, yolox_params const& p, float* r
     // Official YOLOX preprocessing: letterbox to input_size (pad bottom/right with 114),
     // BGR channel order, raw 0..255 values, no normalisation.
     int const s = p.input_size;
+    if (s < 32 || s > 4096 || s % 32) {
+        throw except("YOLOX: input size must be a multiple of 32 in 32..4096, got {}", s);
+    }
+    if (image.extent[0] < 1 || image.extent[1] < 1) {
+        throw except("YOLOX: empty image");
+    }
     float r = std::min(float(s) / float(image.extent[0]), float(s) / float(image.extent[1]));
     i32x2 scaled = {std::max(1, int(image.extent[0] * r)), std::max(1, int(image.extent[1] * r))};
     image_data resized;
@@ -196,7 +202,7 @@ std::vector<yolox_box> yolox_decode(
                 }
                 float obj = 1.f / (1.f + std::exp(-v[4]));
                 float score = obj / (1.f + std::exp(-v[5 + best]));
-                if (score < score_thr) {
+                if (!(score >= score_thr)) { // also drops NaN, which would break std::sort
                     continue;
                 }
                 float cx = (v[0] + float(gx)) * float(stride);
