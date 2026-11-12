@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -43,6 +43,7 @@ Commands:
     esrgan    - ESRGAN/Real-ESRGAN upscaling
     clip      - CLIP vision image embedding (writes floats as text)
     yolox     - YOLOX object detection (writes boxes as text: label score x0 y0 x1 y1)
+    pose      - RTMPose/DWPose keypoints for a person box -p x0 y0 x1 y1 (writes x y score)
 
 Options:
     -i, --input <image1> [<image2> ...]  Input image(s)
@@ -132,6 +133,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::clip;
     } else if (arg1 == "yolox") {
         r.command = cli_command::yolox;
+    } else if (arg1 == "pose" || arg1 == "rtmpose") {
+        r.command = cli_command::pose;
     } else if (arg1 == "-h" || arg1 == "--help") {
         print_usage();
     } else {
@@ -176,6 +179,7 @@ void run_migan(cli_args const&);
 void run_esrgan(cli_args const&);
 void run_clip(cli_args const&);
 void run_yolox(cli_args const&);
+void run_pose(cli_args const&);
 
 } // namespace visp
 
@@ -196,6 +200,7 @@ int main(int argc, char** argv) {
             case cli_command::esrgan: run_esrgan(args); break;
             case cli_command::clip: run_clip(args); break;
             case cli_command::yolox: run_yolox(args); break;
+            case cli_command::pose: run_pose(args); break;
             case cli_command::none: break;
         }
 
@@ -696,6 +701,48 @@ void run_yolox(cli_args const& args) {
     }
     fclose(f);
     printf("-> %d boxes saved to %s\n", int(boxes.size()), args.output);
+}
+
+void run_pose(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] = load_model_weights(
+        args, backend, "DWPose-L-384-F16.gguf", 0, backend.preferred_layout());
+
+    require_inputs(args.inputs, 1, "<image>");
+    if (args.prompt.size() != 4) {
+        throw except("pose needs a person box: -p x0 y0 x1 y1");
+    }
+    std::array<float, 4> box;
+    for (int i = 0; i < 4; ++i) {
+        box[i] = std::strtof(args.prompt[i], nullptr);
+    }
+    image_data image = image_load(args.inputs[0]);
+    rtmpose_params params = rtmpose_detect_params(file);
+    rtmpose_crop crop;
+    image_data input_data = rtmpose_process_input(image, box, params, &crop);
+    printf("- input %dx%d, keypoints %d\n", params.input_width, params.input_height, params.num_keypoints);
+
+    compute_graph graph = compute_graph_init(4096);
+    model_ref m(weights, graph);
+    print_model_flags(m);
+    tensor input = compute_graph_input(m, GGML_TYPE_F32, {3, params.input_width, params.input_height, 1});
+    rtmpose_output output = rtmpose_detect(m, input, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input, input_data);
+    compute_timed(graph, backend);
+
+    tensor_data simcc = transfer_from_backend(output.simcc);
+    std::vector<rtmpose_keypoint> kps = rtmpose_decode(simcc.as_f32(), params, crop);
+    FILE* f = fopen(args.output, "w");
+    if (!f) {
+        throw except("Cannot write {}", args.output);
+    }
+    for (auto const& k : kps) {
+        fprintf(f, "%.2f %.2f %.4f\n", k.x, k.y, k.score);
+    }
+    fclose(f);
+    printf("-> %d keypoints saved to %s\n", int(kps.size()), args.output);
 }
 
 } // namespace visp

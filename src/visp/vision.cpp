@@ -20,6 +20,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::clip;
     } else if (arch == "yolox") {
         return model_family::yolox;
+    } else if (arch == "rtmpose") {
+        return model_family::rtmpose;
     }
     return model_family::count;
 }
@@ -231,6 +233,34 @@ std::vector<yolox_box> yolox_compute(
     compute(model.graph, *model.backend);
     tensor_data raw = transfer_from_backend(model.output.raw);
     return yolox_decode(raw.as_f32(), model.params, ratio, score_thr, nms_thr);
+}
+
+rtmpose_model rtmpose_load_model(char const* filepath, backend_device const& dev) {
+    rtmpose_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = rtmpose_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    return model;
+}
+
+std::vector<rtmpose_keypoint> rtmpose_compute(
+    rtmpose_model& model, image_view image, std::array<float, 4> box) {
+    auto const& p = model.params;
+    if (!model.graph) {
+        model.graph = compute_graph_init(4096);
+        model_ref m(model.weights, model.graph);
+        model.input = compute_graph_input(m, GGML_TYPE_F32, {3, p.input_width, p.input_height, 1});
+        model.output = rtmpose_detect(m, model.input, p);
+        compute_graph_allocate(model.graph, *model.backend);
+    }
+    rtmpose_crop crop;
+    image_data img = rtmpose_process_input(image, box, p, &crop);
+    transfer_to_backend(model.input, img);
+    compute(model.graph, *model.backend);
+    tensor_data simcc = transfer_from_backend(model.output.simcc);
+    return rtmpose_decode(simcc.as_f32(), p, crop);
 }
 
 //

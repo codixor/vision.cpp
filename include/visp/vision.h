@@ -91,6 +91,7 @@ enum class model_family {
     esrgan,
     clip,
     yolox,
+    rtmpose,
 
     count
 };
@@ -289,6 +290,44 @@ VISP_API std::vector<yolox_box> yolox_decode(
     span<float const> raw, yolox_params const&, float ratio, float score_thr, float nms_thr);
 
 //
+// RTMPose / DWPose - top-down whole-body pose estimation (keypoints for one person box)
+
+struct rtmpose_model;
+
+struct rtmpose_params {
+    int input_width = 288;
+    int input_height = 384;
+    int num_keypoints = 133;
+    int final_kernel = 7;
+    int gau_s = 128;
+    int gau_e = 512;
+    std::array<int, 4> stage_depths{3, 6, 6, 3};
+};
+
+struct rtmpose_output {
+    tensor simcc = nullptr; // [2*W + 2*H, keypoints]: SimCC x logits, then y logits
+};
+
+struct rtmpose_crop {
+    float cx = 0, cy = 0, w = 0, h = 0; // crop centre and size in input-image pixels
+};
+
+struct rtmpose_keypoint {
+    float x = 0, y = 0, score = 0; // input-image pixels
+};
+
+VISP_API rtmpose_model rtmpose_load_model(char const* filepath, backend_device const&);
+VISP_API std::vector<rtmpose_keypoint> rtmpose_compute(
+    rtmpose_model&, image_view image, std::array<float, 4> box);
+
+VISP_API rtmpose_params rtmpose_detect_params(model_file const&);
+VISP_API image_data rtmpose_process_input(
+    image_view image, std::array<float, 4> box, rtmpose_params const&, rtmpose_crop* crop);
+VISP_API rtmpose_output rtmpose_detect(model_ref, tensor image, rtmpose_params const&);
+VISP_API std::vector<rtmpose_keypoint> rtmpose_decode(
+    span<float const> simcc, rtmpose_params const&, rtmpose_crop const&);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -414,6 +453,17 @@ struct yolox_model {
     compute_graph graph;
     tensor input = nullptr;
     yolox_output output;
+};
+
+// internal
+struct rtmpose_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    rtmpose_params params;
+
+    compute_graph graph;
+    tensor input = nullptr;
+    rtmpose_output output;
 };
 
 // internal

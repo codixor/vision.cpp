@@ -25,6 +25,9 @@ enum Val {
     Tuple(Vec<Val>),
     Dict(Vec<(Val, Val)>),
     Global(String),
+    /// An object of a class outside the allow-list (e.g. numpy metadata). Never constructed or
+    /// called; kept only as an inert placeholder and skipped on output.
+    Opaque(String),
     Storage { dtype: Dtype, key: String },
     Tensor(Tensor),
 }
@@ -134,7 +137,11 @@ fn storage(pid: Val) -> Result<Val> {
 }
 
 fn reduce(f: Val, args: Val) -> Result<Val> {
-    let Val::Global(name) = f else { return Err("REDUCE on a non-global".into()) };
+    let name = match f {
+        Val::Global(name) => name,
+        Val::Opaque(name) => return Ok(Val::Opaque(name)),
+        _ => return Err("REDUCE on a non-global".into()),
+    };
     let Val::Tuple(a) = args else { return Err("REDUCE args are not a tuple".into()) };
     match name.as_str() {
         "collections OrderedDict" => Ok(Val::Dict(Vec::new())),
@@ -182,6 +189,9 @@ fn unpickle(b: &[u8]) -> Result<Val> {
                     let m = marks.pop().ok_or("APPENDS without MARK")?;
                     stack.split_off(m)
                 };
+                if matches!(stack.last(), Some(Val::Opaque(_))) {
+                    continue;
+                }
                 let Some(Val::List(l)) = stack.last_mut() else { return Err("APPEND(S) on a non-list".into()) };
                 l.extend(items);
             }
@@ -223,10 +233,11 @@ fn unpickle(b: &[u8]) -> Result<Val> {
             }
             b'c' => {
                 let g = format!("{} {}", r.line()?, r.line()?);
-                if !ALLOWED.contains(&g.as_str()) {
-                    return Err(format!("refusing global {g}").into());
+                if ALLOWED.contains(&g.as_str()) {
+                    stack.push(Val::Global(g));
+                } else {
+                    stack.push(Val::Opaque(g));
                 }
-                stack.push(Val::Global(g));
             }
             b't' => {
                 let m = marks.pop().ok_or("TUPLE without MARK")?;
@@ -243,6 +254,16 @@ fn unpickle(b: &[u8]) -> Result<Val> {
                 let pid = pop(&mut stack)?;
                 stack.push(storage(pid)?);
             }
+            0x81 => {
+                // NEWOBJ cls args: only ever applied to non-allow-listed classes -> placeholder.
+                let _args = pop(&mut stack)?;
+                let cls = pop(&mut stack)?;
+                let name = match cls {
+                    Val::Opaque(n) | Val::Global(n) => n,
+                    _ => "?".into(),
+                };
+                stack.push(Val::Opaque(name));
+            }
             b'R' => {
                 let args = pop(&mut stack)?;
                 let f = pop(&mut stack)?;
@@ -257,6 +278,9 @@ fn unpickle(b: &[u8]) -> Result<Val> {
                     let m = marks.pop().ok_or("SETITEMS without MARK")?;
                     stack.split_off(m)
                 };
+                if matches!(stack.last(), Some(Val::Opaque(_))) {
+                    continue;
+                }
                 let Some(Val::Dict(d)) = stack.last_mut() else { return Err("SETITEM(S) on a non-dict".into()) };
                 for kv in items.chunks(2) {
                     if let [k, v] = kv {
@@ -283,7 +307,7 @@ fn flatten(prefix: &str, v: Val, out: &mut Vec<(String, Tensor)>) -> Result<()> 
             out.push((prefix.to_string(), t));
             Ok(())
         }
-        Val::None | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Str(_) | Val::List(_) => {
+        Val::None | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Str(_) | Val::List(_) | Val::Opaque(_) => {
             eprintln!("skipping non-tensor entry {prefix}");
             Ok(())
         }

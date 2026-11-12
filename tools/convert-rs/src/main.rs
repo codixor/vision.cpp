@@ -1,7 +1,7 @@
 //! visp-convert: turn `.safetensors` weights into vision.cpp GGUF files.
 //!
 //! usage: visp-convert <arch> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]
-//! arch: clip, yolox (use `pickle2safetensors --key model` on the official .pth first)
+//! arch: clip, yolox, rtmpose (use `pickle2safetensors --key model` on the official .pth first)
 
 mod gguf;
 
@@ -241,18 +241,104 @@ fn convert_yolox(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) ->
     Ok(())
 }
 
+/// RTMPose / DWPose (mmpose, Apache-2.0): CSPNeXt backbone + RTMCC SimCC head.
+/// ConvModule batch norms (eps 1e-5) are fused; every other tensor is copied.
+fn convert_rtmpose(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> Result<()> {
+    const EPS: f32 = 1e-5;
+    let blocks = |stage: u32, csp: u32| {
+        let pre = format!("backbone.stage{stage}.{csp}.blocks.");
+        model
+            .keys()
+            .filter_map(|k| k.strip_prefix(&pre)?.split('.').next()?.parse::<u64>().ok())
+            .max()
+            .map_or(0, |n| n + 1)
+    };
+    let depths = [blocks(1, 1), blocks(2, 1), blocks(3, 1), blocks(4, 2)];
+    let stem = get(model, "backbone.stem.2.conv.weight")?;
+    let final_layer = get(model, "head.final_layer.weight")?;
+    let keypoints = *final_layer.shape.first().ok_or("bad final layer")?;
+    let kernel = *final_layer.shape.get(2).ok_or("bad final layer")?;
+    let s = *get(model, "head.gau.gamma")?.shape.get(1).ok_or("bad gamma")?;
+    let uv = *get(model, "head.gau.uv.weight")?.shape.first().ok_or("bad uv")?;
+    let cls_x = *get(model, "head.cls_x.weight")?.shape.first().ok_or("bad cls_x")?;
+    let cls_y = *get(model, "head.cls_y.weight")?.shape.first().ok_or("bad cls_y")?;
+    // SimCC bins = input size * split ratio (2 for all released RTMPose/DWPose models).
+    let (w, h) = (cls_x / 2, cls_y / 2);
+    let int = |v: u64| Value::I32(i32::try_from(v).unwrap_or(i32::MAX));
+    g.kv("general.architecture", Value::Str("rtmpose".into()));
+    g.kv("general.file_type", Value::U32(u32::from(f16)));
+    g.kv("rtmpose.tensor_data_layout", Value::Str("whcn".into()));
+    g.kv("rtmpose.stem_channels", int(*stem.shape.first().ok_or("bad stem")?));
+    g.kv(
+        "rtmpose.stage_depths",
+        Value::I32Array(depths.iter().map(|d| i32::try_from(*d).unwrap_or(0)).collect()),
+    );
+    g.kv("rtmpose.input_width", int(w));
+    g.kv("rtmpose.input_height", int(h));
+    g.kv("rtmpose.num_keypoints", int(keypoints));
+    g.kv("rtmpose.final_kernel", int(kernel));
+    g.kv("rtmpose.gau_s", int(s));
+    g.kv("rtmpose.gau_e", int((uv - s) / 2));
+    println!("rtmpose: input {w}x{h}, keypoints {keypoints}, depths {depths:?}, s {s}, e {}", (uv - s) / 2);
+
+    let mut conv2d = Vec::new();
+    let mut push = |g: &mut Writer, name: &str, shape: Vec<u64>, values: &[f32]| -> Result<()> {
+        let is_conv = shape.len() == 4;
+        if is_conv {
+            conv2d.push(i32::try_from(g.len())?);
+        }
+        let dtype = if is_conv && f16 { DType::F16 } else { DType::F32 };
+        g.tensor(Tensor::from_f32(name, shape, values, dtype))?;
+        Ok(())
+    };
+    for (name, src) in model {
+        if name.contains(".bn.") {
+            continue;
+        }
+        let Some(prefix) = name.strip_suffix(".conv.weight") else {
+            push(g, name, src.shape.clone(), &src.values)?;
+            continue;
+        };
+        let bn = |s: &str| get(model, &format!("{prefix}.bn.{s}"));
+        let (gamma, beta, mean, var) = (bn("weight")?, bn("bias")?, bn("running_mean")?, bn("running_var")?);
+        let out = gamma.values.len();
+        let per = src.values.len() / out;
+        let mut weight = src.values.clone();
+        let mut bias = vec![0f32; out];
+        for o in 0..out {
+            let (Some(ga), Some(be), Some(mu), Some(va)) =
+                (gamma.values.get(o), beta.values.get(o), mean.values.get(o), var.values.get(o))
+            else {
+                return Err(format!("{prefix}: bn size mismatch").into());
+            };
+            let k = ga / (va + EPS).sqrt();
+            for v in weight.iter_mut().skip(o * per).take(per) {
+                *v *= k;
+            }
+            if let Some(b) = bias.get_mut(o) {
+                *b = be - mu * k;
+            }
+        }
+        push(g, &format!("{prefix}.conv.weight"), src.shape.clone(), &weight)?;
+        push(g, &format!("{prefix}.conv.bias"), vec![out as u64], &bias)?;
+    }
+    g.kv("rtmpose.conv2d_weights", Value::I32Array(conv2d));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [arch, input, output] = pos.as_slice() else {
-        return Err("usage: visp-convert <clip|yolox> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
+        return Err("usage: visp-convert <clip|yolox|rtmpose> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
     };
     let model = load(Path::new(input.as_str()))?;
     let mut g = Writer::default();
     match arch.as_str() {
         "clip" => convert_clip(&model, &mut g, !flag("--f32"), flag("--quick-gelu"))?,
         "yolox" => convert_yolox(&model, &mut g, !flag("--f32"))?,
+        "rtmpose" => convert_rtmpose(&model, &mut g, !flag("--f32"))?,
         other => return Err(format!("unknown arch {other}").into()),
     }
     let size = g.write(Path::new(output.as_str()))?;
