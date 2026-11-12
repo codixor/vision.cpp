@@ -5,6 +5,7 @@ target_sources(visioncpp PRIVATE
   arch/clip.cpp
   arch/yolox.cpp
   arch/rtmpose.cpp
+  arch/gfpgan.cpp
   arch/depth-anything.cpp
   arch/dino.cpp
   arch/esrgan.cpp

@@ -22,6 +22,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::yolox;
     } else if (arch == "rtmpose") {
         return model_family::rtmpose;
+    } else if (arch == "gfpgan") {
+        return model_family::gfpgan;
     }
     return model_family::count;
 }
@@ -261,6 +263,38 @@ std::vector<rtmpose_keypoint> rtmpose_compute(
     compute(model.graph, *model.backend);
     tensor_data simcc = transfer_from_backend(model.output.simcc);
     return rtmpose_decode(simcc.as_f32(), p, crop);
+}
+
+gfpgan_model gfpgan_load_model(char const* filepath, backend_device const& dev) {
+    gfpgan_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = gfpgan_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), tensor_data_layout::whcn);
+    return model;
+}
+
+image_data gfpgan_compute(gfpgan_model& model, image_view face) {
+    int const s = model.params.image_size;
+    if (!model.graph) {
+        model.graph = compute_graph_init(4096);
+        model_ref m(model.weights, model.graph);
+        model.input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+        model.output = gfpgan_restore(m, model.input, model.params);
+        compute_graph_allocate(model.graph, *model.backend);
+    }
+    image_data resized;
+    if (face.extent != i32x2{s, s}) {
+        resized = image_scale(face, {s, s});
+        face = image_view(resized);
+    }
+    image_data input = image_u8_to_f32(face, image_format::rgb_f32);
+    transfer_to_backend(model.input, input);
+    compute(model.graph, *model.backend);
+    image_data output = image_alloc({s, s}, image_format::rgb_f32);
+    transfer_from_backend(model.output, output);
+    return image_f32_to_u8(output, image_format::rgba_u8);
 }
 
 //

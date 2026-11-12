@@ -92,6 +92,7 @@ enum class model_family {
     clip,
     yolox,
     rtmpose,
+    gfpgan,
 
     count
 };
@@ -328,6 +329,32 @@ VISP_API std::vector<rtmpose_keypoint> rtmpose_decode(
     span<float const> simcc, rtmpose_params const&, rtmpose_crop const&);
 
 //
+// GFPGAN - blind face restoration of an aligned face crop (v1.3/v1.4 "clean")
+
+struct gfpgan_model;
+
+struct gfpgan_params {
+    int image_size = 512;
+    int style_dim = 512;
+    int num_latent = 16;
+
+    int levels() const { // number of U-Net down/up steps (512 -> 7)
+        int n = 0;
+        for (int s = image_size; s > 4; s /= 2) ++n;
+        return n;
+    }
+};
+
+// Loads a GFPGAN model; the weights are kept in WHCN layout (bilinear resampling).
+VISP_API gfpgan_model gfpgan_load_model(char const* filepath, backend_device const&);
+
+// Restores an aligned face crop (resized to image_size if needed). Returns rgba_u8.
+VISP_API image_data gfpgan_compute(gfpgan_model&, image_view face);
+
+VISP_API gfpgan_params gfpgan_detect_params(model_file const&);
+VISP_API tensor gfpgan_restore(model_ref, tensor image, gfpgan_params const&);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -464,6 +491,17 @@ struct rtmpose_model {
     compute_graph graph;
     tensor input = nullptr;
     rtmpose_output output;
+};
+
+// internal
+struct gfpgan_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    gfpgan_params params;
+
+    compute_graph graph;
+    tensor input = nullptr;
+    tensor output = nullptr;
 };
 
 // internal

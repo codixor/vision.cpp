@@ -326,12 +326,88 @@ fn convert_rtmpose(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) 
     Ok(())
 }
 
+/// GFPGAN v1.3/v1.4 "clean" (Tencent ARC, Apache-2.0): U-Net encoder + StyleGAN2-style decoder
+/// with SFT. Modulated convolution weights lose their leading batch dim and get a `wsq` table
+/// (sum of squared kernel taps, [cout, cin]) so demodulation is a small matmul at run time.
+/// The fixed noise buffers are pre-multiplied by their learned strength (deterministic output,
+/// equivalent to `randomize_noise=False`).
+fn convert_gfpgan(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> Result<()> {
+    let down = model.keys().filter(|k| k.starts_with("conv_body_down.") && k.ends_with(".conv1.weight")).count();
+    let first = get(model, "conv_body_first.weight")?;
+    let linear = get(model, "final_linear.weight")?;
+    let style = *get(model, "stylegan_decoder.style_conv1.modulated_conv.modulation.weight")?.shape.get(1).ok_or("bad modulation")?;
+    let size = 4u64 << down;
+    let int = |v: u64| Value::I32(i32::try_from(v).unwrap_or(i32::MAX));
+    g.kv("general.architecture", Value::Str("gfpgan".into()));
+    g.kv("general.file_type", Value::U32(u32::from(f16)));
+    g.kv("gfpgan.tensor_data_layout", Value::Str("whcn".into()));
+    g.kv("gfpgan.image_size", int(size));
+    g.kv("gfpgan.style_dim", int(style));
+    g.kv("gfpgan.num_latent", int(*linear.shape.first().ok_or("bad linear")? / style));
+    println!("gfpgan: {size}x{size}, {down} levels, first {} ch, style {style}", first.shape[0]);
+
+    let mut conv2d = Vec::new();
+    let mut push = |g: &mut Writer, name: &str, shape: Vec<u64>, values: &[f32], conv: bool| -> Result<()> {
+        if conv {
+            conv2d.push(i32::try_from(g.len())?);
+        }
+        // GGUF names are limited to 63 bytes: shorten the decoder prefixes.
+        let name = &name.replace("stylegan_decoder.", "dec.").replace("modulated_conv.", "mod.");
+        let big = shape.iter().product::<u64>() >= 4096 && shape.len() >= 2;
+        let dtype = if f16 && (conv || big) && !name.ends_with(".noise") && !name.ends_with(".wsq") { DType::F16 } else { DType::F32 };
+        g.tensor(Tensor::from_f32(name, shape, values, dtype))?;
+        Ok(())
+    };
+    for (name, src) in model {
+        if name.starts_with("stylegan_decoder.noises.") || name.starts_with("toRGB.") || name.contains(".style_mlp.") {
+            continue; // noise handled below; intermediate RGB heads and style MLP are unused
+        }
+        if let Some(prefix) = name.strip_suffix(".modulated_conv.weight") {
+            let shape: Vec<u64> = src.shape.iter().skip(1).copied().collect(); // drop batch dim
+            let (o, i) = (shape[0] as usize, shape[1] as usize);
+            let kk = src.values.len() / (o * i);
+            let wsq: Vec<f32> = src.values.chunks_exact(kk).map(|c| c.iter().map(|v| v * v).sum()).collect();
+            push(g, name, shape, &src.values, true)?;
+            push(g, &format!("{prefix}.modulated_conv.wsq"), vec![o as u64, i as u64], &wsq, false)?;
+            continue;
+        }
+        let is_decoder_bias = name.starts_with("stylegan_decoder.") && name.ends_with(".bias") && src.shape.len() == 4;
+        if is_decoder_bias {
+            push(g, name, vec![*src.shape.get(1).ok_or("bad bias")?], &src.values, false)?;
+            continue;
+        }
+        if name.starts_with("stylegan_decoder.") && name.ends_with(".weight") && src.shape == [1] {
+            // noise strength: fold into the matching noise buffer
+            let layer = if name == "stylegan_decoder.style_conv1.weight" {
+                0
+            } else {
+                let j: usize = name.split('.').nth(2).ok_or("bad name")?.parse()?;
+                j + 1
+            };
+            let noise = get(model, &format!("stylegan_decoder.noises.noise{layer}"))?;
+            let strength = src.values[0];
+            let v: Vec<f32> = noise.values.iter().map(|n| n * strength).collect();
+            let r = *noise.shape.last().ok_or("bad noise")?;
+            let base = name.strip_suffix(".weight").ok_or("bad name")?;
+            push(g, &format!("{base}.noise"), vec![r, r], &v, false)?;
+            continue;
+        }
+        if name == "stylegan_decoder.constant_input.weight" {
+            push(g, name, src.shape.iter().skip(1).copied().collect(), &src.values, false)?;
+            continue;
+        }
+        push(g, name, src.shape.clone(), &src.values, src.shape.len() == 4)?;
+    }
+    g.kv("gfpgan.conv2d_weights", Value::I32Array(conv2d));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [arch, input, output] = pos.as_slice() else {
-        return Err("usage: visp-convert <clip|yolox|rtmpose> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
+        return Err("usage: visp-convert <clip|yolox|rtmpose|gfpgan> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
     };
     let model = load(Path::new(input.as_str()))?;
     let mut g = Writer::default();
@@ -339,6 +415,7 @@ fn main() -> Result<()> {
         "clip" => convert_clip(&model, &mut g, !flag("--f32"), flag("--quick-gelu"))?,
         "yolox" => convert_yolox(&model, &mut g, !flag("--f32"))?,
         "rtmpose" => convert_rtmpose(&model, &mut g, !flag("--f32"))?,
+        "gfpgan" => convert_gfpgan(&model, &mut g, !flag("--f32"))?,
         other => return Err(format!("unknown arch {other}").into()),
     }
     let size = g.write(Path::new(output.as_str()))?;

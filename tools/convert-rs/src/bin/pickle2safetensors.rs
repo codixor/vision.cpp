@@ -1,7 +1,8 @@
-//! Convert a PyTorch zip checkpoint (`torch.save` of a state dict, e.g. `photomaker-v2.bin`)
-//! into `.safetensors` without Python or PyTorch.
+//! Convert a PyTorch checkpoint (`torch.save` of a state dict, e.g. `photomaker-v2.bin`) into
+//! `.safetensors` without Python or PyTorch. Both the zip format and the legacy (pre-1.6)
+//! sequential-pickle format are read.
 //!
-//! usage: pickle2safetensors <input.bin|.pt|.pth> <output.safetensors>
+//! usage: pickle2safetensors <input.bin|.pt|.pth> <output.safetensors> [--photomaker] [--key NAME]
 //!
 //! The pickle is *interpreted as data*, never executed: only the opcodes a state dict needs are
 //! implemented, and only these globals are accepted: `collections.OrderedDict`,
@@ -167,7 +168,12 @@ fn reduce(f: Val, args: Val) -> Result<Val> {
 }
 
 fn unpickle(b: &[u8]) -> Result<Val> {
-    let mut r = Reader { b, p: 0 };
+    unpickle_at(b, 0).map(|(v, _)| v)
+}
+
+/// Unpickles one pickle starting at `start`; returns the value and the offset after STOP.
+fn unpickle_at(b: &[u8], start: usize) -> Result<(Val, usize)> {
+    let mut r = Reader { b, p: start };
     let mut stack: Vec<Val> = Vec::new();
     let mut marks: Vec<usize> = Vec::new();
     let mut memo: HashMap<u32, Val> = HashMap::new();
@@ -178,7 +184,7 @@ fn unpickle(b: &[u8]) -> Result<Val> {
             0x80 => {
                 r.u8()?; // PROTO
             }
-            b'.' => return pop(&mut stack).map_err(Into::into), // STOP
+            b'.' => return Ok((pop(&mut stack)?, r.p)), // STOP
             b'}' => stack.push(Val::Dict(Vec::new())),
             b']' => stack.push(Val::List(Vec::new())),
             b'G' => stack.push(Val::Float(f64::from_be_bytes(r.take(8)?.try_into()?))),
@@ -207,6 +213,23 @@ fn unpickle(b: &[u8]) -> Result<Val> {
             b'J' => stack.push(Val::Int(i64::from(i32::from_le_bytes(r.take(4)?.try_into()?)))),
             b'K' => stack.push(Val::Int(i64::from(r.u8()?))),
             b'M' => stack.push(Val::Int(i64::from(r.u16()?))),
+            0x8a => {
+                // LONG1: little-endian two's complement of n bytes (legacy magic number)
+                let n = usize::from(r.u8()?);
+                let bytes = r.take(n)?;
+                if n > 8 {
+                    stack.push(Val::Opaque("long".into())); // only the legacy magic number
+                    continue;
+                }
+                let mut v: i64 = 0;
+                for (i, &c) in bytes.iter().enumerate() {
+                    v |= i64::from(c) << (8 * i);
+                }
+                if n > 0 && n < 8 && bytes[n - 1] & 0x80 != 0 {
+                    v -= 1i64 << (8 * n);
+                }
+                stack.push(Val::Int(v));
+            }
             b'X' => {
                 let n = r.u32()? as usize;
                 stack.push(Val::Str(String::from_utf8(r.take(n)?.to_vec())?));
@@ -329,6 +352,46 @@ fn json_str(s: &str) -> String {
     o
 }
 
+/// Legacy `torch.save` layout: magic number, protocol version and sys info pickles, the object
+/// pickle, a pickle listing storage keys, then per storage an 8-byte element count and raw data.
+fn legacy(raw: &[u8], storages: &mut HashMap<String, Vec<u8>>) -> Result<Val> {
+    // PROTO 2, LONG1 10 bytes: 0x1950a86a20f9469cfc6c little-endian
+    const MAGIC: [u8; 14] = [0x80, 2, 0x8a, 10, 0x6c, 0xfc, 0x9c, 0x46, 0xf9, 0x20, 0x6a, 0xa8, 0x50, 0x19];
+    if !raw.starts_with(&MAGIC) {
+        return Err("not a PyTorch checkpoint (no zip header, no legacy magic number)".into());
+    }
+    let (_magic, p) = unpickle_at(raw, 0)?;
+    let (_protocol, p) = unpickle_at(raw, p)?;
+    let (_sys_info, p) = unpickle_at(raw, p)?;
+    let (obj, p) = unpickle_at(raw, p)?;
+    let (keys, mut p) = unpickle_at(raw, p)?;
+    let Val::List(keys) = keys else { return Err("legacy storage key list missing".into()) };
+    // Element sizes come from the storages the object pickle referenced.
+    let mut sizes: HashMap<String, usize> = HashMap::new();
+    collect_storage_sizes(&obj, &mut sizes);
+    for k in keys {
+        let Val::Str(k) = k else { return Err("non-string storage key".into()) };
+        let n = u64::from_le_bytes(raw.get(p..p + 8).ok_or("truncated storage header")?.try_into()?);
+        p += 8;
+        let es = *sizes.get(&k).ok_or_else(|| format!("storage {k} not referenced"))?;
+        let len = usize::try_from(n)?.checked_mul(es).ok_or("storage size overflow")?;
+        storages.insert(k, raw.get(p..p + len).ok_or("truncated storage data")?.to_vec());
+        p += len;
+    }
+    Ok(obj)
+}
+
+fn collect_storage_sizes(v: &Val, out: &mut HashMap<String, usize>) {
+    match v {
+        Val::Tensor(t) => {
+            out.insert(t.key.clone(), t.dtype.size());
+        }
+        Val::Dict(items) => items.iter().for_each(|(_, v)| collect_storage_sizes(v, out)),
+        Val::List(l) | Val::Tuple(l) => l.iter().for_each(|v| collect_storage_sizes(v, out)),
+        _ => {}
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let photomaker = args.iter().any(|a| a == "--photomaker");
@@ -342,17 +405,31 @@ fn main() -> Result<()> {
     let [input, output] = pos.as_slice() else {
         return Err("usage: pickle2safetensors <input.bin> <output.safetensors> [--photomaker] [--key NAME]".into());
     };
-    let mut zip = zip::ZipArchive::new(File::open(input)?)?;
-    let pkl = (0..zip.len())
-        .filter_map(|i| zip.name_for_index(i).map(str::to_string))
-        .find(|n| n.ends_with("/data.pkl") || n == "data.pkl")
-        .ok_or("no data.pkl: not a torch zip checkpoint (legacy pickles are not supported)")?;
-    let root = pkl.strip_suffix("data.pkl").unwrap_or_default().to_string();
-    let mut bytes = Vec::new();
-    zip.by_name(&pkl)?.read_to_end(&mut bytes)?;
-
+    let mut raw = Vec::new();
+    File::open(input)?.read_to_end(&mut raw)?;
+    let mut storages: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut root_val = if raw.starts_with(b"PK") {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&raw[..]))?;
+        let pkl = (0..zip.len())
+            .filter_map(|i| zip.name_for_index(i).map(str::to_string))
+            .find(|n| n.ends_with("/data.pkl") || n == "data.pkl")
+            .ok_or("no data.pkl: not a torch zip checkpoint")?;
+        let root = pkl.strip_suffix("data.pkl").unwrap_or_default().to_string();
+        let mut bytes = Vec::new();
+        zip.by_name(&pkl)?.read_to_end(&mut bytes)?;
+        let names: Vec<String> = (0..zip.len()).filter_map(|i| zip.name_for_index(i).map(str::to_string)).collect();
+        for n in names {
+            if let Some(k) = n.strip_prefix(&format!("{root}data/")) {
+                let mut data = Vec::new();
+                zip.by_name(&n)?.read_to_end(&mut data)?;
+                storages.insert(k.to_string(), data);
+            }
+        }
+        unpickle(&bytes)?
+    } else {
+        legacy(&raw, &mut storages)?
+    };
     let mut tensors = Vec::new();
-    let mut root_val = unpickle(&bytes)?;
     if let Some(k) = &key {
         let Val::Dict(items) = root_val else { return Err("--key needs a dict at the root".into()) };
         root_val = items
@@ -405,14 +482,8 @@ fn main() -> Result<()> {
     let mut w = BufWriter::new(File::create(output)?);
     w.write_all(&(header.len() as u64).to_le_bytes())?;
     w.write_all(header.as_bytes())?;
-    let mut cache: Option<(String, Vec<u8>)> = None;
     for (name, t) in &tensors {
-        if cache.as_ref().map(|c| &c.0) != Some(&t.key) {
-            let mut data = Vec::new();
-            zip.by_name(&format!("{root}data/{}", t.key))?.read_to_end(&mut data)?;
-            cache = Some((t.key.clone(), data));
-        }
-        let data = cache.as_ref().map(|c| &c.1).ok_or("storage cache")?;
+        let data = storages.get(&t.key).ok_or_else(|| format!("{name}: missing storage {}", t.key))?;
         let es = t.dtype.size();
         let n: usize = t.shape.iter().product();
         let slice = data

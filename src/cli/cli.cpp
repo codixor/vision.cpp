@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose, gfpgan };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -43,6 +43,7 @@ Commands:
     esrgan    - ESRGAN/Real-ESRGAN upscaling
     clip      - CLIP vision image embedding (writes floats as text)
     yolox     - YOLOX object detection (writes boxes as text: label score x0 y0 x1 y1)
+    gfpgan    - GFPGAN face restoration of an aligned face crop (writes an image)
     pose      - RTMPose/DWPose keypoints for a person box -p x0 y0 x1 y1 (writes x y score)
 
 Options:
@@ -133,6 +134,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::clip;
     } else if (arg1 == "yolox") {
         r.command = cli_command::yolox;
+    } else if (arg1 == "gfpgan") {
+        r.command = cli_command::gfpgan;
     } else if (arg1 == "pose" || arg1 == "rtmpose") {
         r.command = cli_command::pose;
     } else if (arg1 == "-h" || arg1 == "--help") {
@@ -180,6 +183,7 @@ void run_esrgan(cli_args const&);
 void run_clip(cli_args const&);
 void run_yolox(cli_args const&);
 void run_pose(cli_args const&);
+void run_gfpgan(cli_args const&);
 
 } // namespace visp
 
@@ -201,6 +205,7 @@ int main(int argc, char** argv) {
             case cli_command::clip: run_clip(args); break;
             case cli_command::yolox: run_yolox(args); break;
             case cli_command::pose: run_pose(args); break;
+            case cli_command::gfpgan: run_gfpgan(args); break;
             case cli_command::none: break;
         }
 
@@ -743,6 +748,37 @@ void run_pose(cli_args const& args) {
     }
     fclose(f);
     printf("-> %d keypoints saved to %s\n", int(kps.size()), args.output);
+}
+
+void run_gfpgan(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] =
+        load_model_weights(args, backend, "GFPGAN-v1.4-F16.gguf", 0, tensor_data_layout::whcn);
+    gfpgan_params params = gfpgan_detect_params(file);
+    int const s = params.image_size;
+    printf("- face size %d, latents %d\n", s, params.num_latent);
+
+    require_inputs(args.inputs, 1, "<aligned face image>");
+    image_data image = image_load(args.inputs[0]);
+    if (image.extent != i32x2{s, s}) {
+        image = image_scale(image, {s, s});
+    }
+    image_data input_data = image_u8_to_f32(image, image_format::rgb_f32);
+
+    compute_graph graph = compute_graph_init(4096);
+    model_ref m(weights, graph);
+    print_model_flags(m);
+    tensor input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+    tensor output = gfpgan_restore(m, input, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input, input_data);
+    compute_timed(graph, backend);
+
+    image_data out = image_alloc({s, s}, image_format::rgb_f32);
+    transfer_from_backend(output, out);
+    image_save(image_f32_to_u8(out, image_format::rgba_u8), args.output);
+    printf("-> output image saved to %s\n", args.output);
 }
 
 } // namespace visp
