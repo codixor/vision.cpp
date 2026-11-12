@@ -5,7 +5,7 @@
 //!
 //! The pickle is *interpreted as data*, never executed: only the opcodes a state dict needs are
 //! implemented, and only these globals are accepted: `collections.OrderedDict`,
-//! `torch._utils._rebuild_tensor_v2` and `torch.{Float,Half,BFloat16}Storage`. Anything else
+//! `torch._utils._rebuild_tensor_v2` and `torch.{Float,Half,BFloat16,Long}Storage`. Anything else
 //! (arbitrary callables, `os.system`, ...) is rejected before any data is touched.
 
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ enum Val {
     None,
     Bool(bool),
     Int(i64),
+    Float(f64),
+    List(Vec<Val>),
     Str(String),
     Tuple(Vec<Val>),
     Dict(Vec<(Val, Val)>),
@@ -32,12 +34,14 @@ enum Dtype {
     F32,
     F16,
     Bf16,
+    I64,
 }
 
 impl Dtype {
     fn size(self) -> usize {
         match self {
             Self::F32 => 4,
+            Self::I64 => 8,
             Self::F16 | Self::Bf16 => 2,
         }
     }
@@ -46,6 +50,7 @@ impl Dtype {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
+            Self::I64 => "I64",
         }
     }
 }
@@ -58,7 +63,8 @@ struct Tensor {
     shape: Vec<usize>,
 }
 
-const ALLOWED: [&str; 5] = [
+const ALLOWED: [&str; 6] = [
+    "torch LongStorage",
     "collections OrderedDict",
     "torch._utils _rebuild_tensor_v2",
     "torch FloatStorage",
@@ -121,6 +127,7 @@ fn storage(pid: Val) -> Result<Val> {
         "torch FloatStorage" => Dtype::F32,
         "torch HalfStorage" => Dtype::F16,
         "torch BFloat16Storage" => Dtype::Bf16,
+        "torch LongStorage" => Dtype::I64,
         other => return Err(format!("unsupported storage {other}").into()),
     };
     Ok(Val::Storage { dtype, key: key.clone() })
@@ -166,6 +173,22 @@ fn unpickle(b: &[u8]) -> Result<Val> {
             }
             b'.' => return pop(&mut stack).map_err(Into::into), // STOP
             b'}' => stack.push(Val::Dict(Vec::new())),
+            b']' => stack.push(Val::List(Vec::new())),
+            b'G' => stack.push(Val::Float(f64::from_be_bytes(r.take(8)?.try_into()?))),
+            b'e' | b'a' => {
+                let items = if op == b'a' {
+                    vec![pop(&mut stack)?]
+                } else {
+                    let m = marks.pop().ok_or("APPENDS without MARK")?;
+                    stack.split_off(m)
+                };
+                let Some(Val::List(l)) = stack.last_mut() else { return Err("APPEND(S) on a non-list".into()) };
+                l.extend(items);
+            }
+            b'b' => {
+                // BUILD: object state (e.g. a state dict's `_metadata`); the data itself is kept.
+                pop(&mut stack)?;
+            }
             b')' => stack.push(Val::Tuple(Vec::new())),
             b'N' => stack.push(Val::None),
             0x88 => stack.push(Val::Bool(true)),
@@ -260,6 +283,10 @@ fn flatten(prefix: &str, v: Val, out: &mut Vec<(String, Tensor)>) -> Result<()> 
             out.push((prefix.to_string(), t));
             Ok(())
         }
+        Val::None | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Str(_) | Val::List(_) => {
+            eprintln!("skipping non-tensor entry {prefix}");
+            Ok(())
+        }
         other => Err(format!("{prefix}: unsupported value {other:?}").into()),
     }
 }
@@ -281,9 +308,15 @@ fn json_str(s: &str) -> String {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let photomaker = args.iter().any(|a| a == "--photomaker");
-    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let key = args.iter().position(|a| a == "--key").and_then(|i| args.get(i + 1)).cloned();
+    let pos: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && !(*i > 0 && args.get(i - 1).is_some_and(|p| p == "--key")))
+        .map(|(_, a)| a)
+        .collect();
     let [input, output] = pos.as_slice() else {
-        return Err("usage: pickle2safetensors <input.bin> <output.safetensors> [--photomaker]".into());
+        return Err("usage: pickle2safetensors <input.bin> <output.safetensors> [--photomaker] [--key NAME]".into());
     };
     let mut zip = zip::ZipArchive::new(File::open(input)?)?;
     let pkl = (0..zip.len())
@@ -295,7 +328,16 @@ fn main() -> Result<()> {
     zip.by_name(&pkl)?.read_to_end(&mut bytes)?;
 
     let mut tensors = Vec::new();
-    flatten("", unpickle(&bytes)?, &mut tensors)?;
+    let mut root_val = unpickle(&bytes)?;
+    if let Some(k) = &key {
+        let Val::Dict(items) = root_val else { return Err("--key needs a dict at the root".into()) };
+        root_val = items
+            .into_iter()
+            .find(|(n, _)| matches!(n, Val::Str(s) if s == k))
+            .map(|(_, v)| v)
+            .ok_or_else(|| format!("no top-level key {k}"))?;
+    }
+    flatten("", root_val, &mut tensors)?;
     if photomaker {
         // stable-diffusion.cpp's PhotoMaker loader expects the layout of the community
         // conversion: no `id_encoder.`/`lora_weights.` level, HF's `pre_layrnorm` typo fixed,

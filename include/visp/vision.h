@@ -90,6 +90,7 @@ enum class model_family {
     migan,
     esrgan,
     clip,
+    yolox,
 
     count
 };
@@ -257,6 +258,37 @@ VISP_API image_data clip_process_input(image_view image, clip_params const&);
 VISP_API clip_output clip_encode(model_ref, tensor image, clip_params const&);
 
 //
+// YOLOX - object detection (COCO 80 classes for the official weights)
+
+struct yolox_model;
+
+struct yolox_params {
+    int input_size = 640;
+    int depth = 1;
+    int num_classes = 80;
+};
+
+struct yolox_output {
+    tensor raw = nullptr; // [5 + num_classes, n_cells]: dx, dy, log w, log h, obj, classes
+};
+
+struct yolox_box {
+    std::array<float, 4> box{}; // x0, y0, x1, y1 in input-image pixels
+    float score = 0;
+    int label = 0;
+};
+
+VISP_API yolox_model yolox_load_model(char const* filepath, backend_device const&);
+VISP_API std::vector<yolox_box> yolox_compute(
+    yolox_model&, image_view image, float score_thr = 0.3f, float nms_thr = 0.45f);
+
+VISP_API yolox_params yolox_detect_params(model_file const&);
+VISP_API image_data yolox_process_input(image_view image, yolox_params const&, float* ratio);
+VISP_API yolox_output yolox_detect(model_ref, tensor image, yolox_params const&);
+VISP_API std::vector<yolox_box> yolox_decode(
+    span<float const> raw, yolox_params const&, float ratio, float score_thr, float nms_thr);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -371,6 +403,17 @@ struct birefnet_model {
     compute_graph graph;
     tensor input = nullptr;
     tensor output = nullptr;
+};
+
+// internal
+struct yolox_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    yolox_params params;
+
+    compute_graph graph;
+    tensor input = nullptr;
+    yolox_output output;
 };
 
 // internal

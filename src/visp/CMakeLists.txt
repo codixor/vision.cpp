@@ -3,6 +3,7 @@ add_library(visioncpp)
 target_sources(visioncpp PRIVATE
   arch/birefnet.cpp
   arch/clip.cpp
+  arch/yolox.cpp
   arch/depth-anything.cpp
   arch/dino.cpp
   arch/esrgan.cpp

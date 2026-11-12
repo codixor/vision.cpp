@@ -1,7 +1,7 @@
 //! visp-convert: turn `.safetensors` weights into vision.cpp GGUF files.
 //!
 //! usage: visp-convert <arch> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]
-//! arch: clip
+//! arch: clip, yolox (use `pickle2safetensors --key model` on the official .pth first)
 
 mod gguf;
 
@@ -137,17 +137,122 @@ fn convert_clip(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool, qui
     Ok(())
 }
 
+/// Rewrite YOLOX's Focus stem (space-to-depth + 3x3 conv) as an equivalent 6x6 stride-2 conv
+/// with padding 2. Focus channel groups are (top-left, bottom-left, top-right, bottom-right).
+fn focus_to_conv6(src: &Source) -> Result<Source> {
+    let [o, i4, kh, kw] = <[u64; 4]>::try_from(src.shape.as_slice())
+        .map_err(|_| "stem kernel must be 4-D")?
+        .map(|d| d as usize);
+    if kh != 3 || kw != 3 || i4 % 4 != 0 {
+        return Err("unexpected Focus stem kernel".into());
+    }
+    let c = i4 / 4;
+    let mut values = vec![0f32; o * c * 36];
+    for oo in 0..o {
+        for (g, (dy, dx)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+            for cc in 0..c {
+                for a in 0..3 {
+                    for b in 0..3 {
+                        let from = ((oo * i4 + g * c + cc) * 3 + a) * 3 + b;
+                        let to = ((oo * c + cc) * 6 + 2 * a + dy) * 6 + 2 * b + dx;
+                        if let (Some(d), Some(v)) = (values.get_mut(to), src.values.get(from)) {
+                            *d = *v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Source { shape: [o, c, 6, 6].map(|d| d as u64).to_vec(), values })
+}
+
+fn convert_yolox(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> Result<()> {
+    const EPS: f32 = 1e-3; // YOLOX sets BatchNorm eps to 1e-3 (init_yolo)
+    let stem = get(model, "backbone.backbone.stem.conv.conv.weight")?;
+    let base_channels = *stem.shape.first().ok_or("bad stem")?;
+    let depth = model
+        .keys()
+        .filter_map(|k| k.strip_prefix("backbone.backbone.dark2.1.m."))
+        .filter_map(|k| k.split('.').next()?.parse::<u64>().ok())
+        .max()
+        .ok_or("no dark2 bottlenecks")?
+        + 1;
+    let classes = *get(model, "head.cls_preds.0.bias")?.shape.first().ok_or("bad cls")?;
+    if model.keys().any(|k| k.contains(".dconv.")) {
+        return Err("depthwise YOLOX (nano/tiny) is not supported".into());
+    }
+    let int = |v: u64| Value::I32(i32::try_from(v).unwrap_or(i32::MAX));
+    g.kv("general.architecture", Value::Str("yolox".into()));
+    g.kv("general.file_type", Value::U32(u32::from(f16)));
+    g.kv("yolox.tensor_data_layout", Value::Str("whcn".into()));
+    g.kv("yolox.base_channels", int(base_channels));
+    g.kv("yolox.depth", int(depth));
+    g.kv("yolox.num_classes", int(classes));
+    println!("yolox: base channels {base_channels}, depth {depth}, classes {classes}");
+
+    let mut conv2d = Vec::new();
+    let mut push = |g: &mut Writer, name: &str, shape: Vec<u64>, values: &[f32]| -> Result<()> {
+        let is_conv = shape.len() == 4;
+        if is_conv {
+            conv2d.push(i32::try_from(g.len())?);
+        }
+        let dtype = if is_conv && f16 { DType::F16 } else { DType::F32 };
+        g.tensor(Tensor::from_f32(name, shape, values, dtype))?;
+        Ok(())
+    };
+    for (name, src) in model {
+        let Some(prefix) = name.strip_suffix(".conv.weight") else {
+            if (name.contains("_preds.")) && (name.ends_with(".weight") || name.ends_with(".bias")) {
+                push(g, name, src.shape.clone(), &src.values)?;
+            }
+            continue;
+        };
+        let stem_conv;
+        let w = if prefix == "backbone.backbone.stem.conv" {
+            stem_conv = focus_to_conv6(src)?;
+            &stem_conv
+        } else {
+            src
+        };
+        let bn = |s: &str| get(model, &format!("{prefix}.bn.{s}"));
+        let (gamma, beta, mean, var) = (bn("weight")?, bn("bias")?, bn("running_mean")?, bn("running_var")?);
+        let out = gamma.values.len();
+        let per = w.values.len() / out;
+        let mut weight = w.values.clone();
+        let mut bias = vec![0f32; out];
+        for o in 0..out {
+            let (Some(ga), Some(be), Some(mu), Some(va)) =
+                (gamma.values.get(o), beta.values.get(o), mean.values.get(o), var.values.get(o))
+            else {
+                return Err(format!("{prefix}: bn size mismatch").into());
+            };
+            let k = ga / (va + EPS).sqrt();
+            for v in weight.iter_mut().skip(o * per).take(per) {
+                *v *= k;
+            }
+            if let Some(b) = bias.get_mut(o) {
+                *b = be - mu * k;
+            }
+        }
+        push(g, &format!("{prefix}.conv.weight"), w.shape.clone(), &weight)?;
+        push(g, &format!("{prefix}.conv.bias"), vec![out as u64], &bias)?;
+    }
+    g.kv("yolox.conv2d_weights", Value::I32Array(conv2d));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [arch, input, output] = pos.as_slice() else {
-        return Err("usage: visp-convert <clip> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
+        return Err("usage: visp-convert <clip|yolox> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
     };
     let model = load(Path::new(input.as_str()))?;
     let mut g = Writer::default();
     match arch.as_str() {
         "clip" => convert_clip(&model, &mut g, !flag("--f32"), flag("--quick-gelu"))?,
+        "yolox" => convert_yolox(&model, &mut g, !flag("--f32"))?,
         other => return Err(format!("unknown arch {other}").into()),
     }
     let size = g.write(Path::new(output.as_str()))?;

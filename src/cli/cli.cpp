@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -42,6 +42,7 @@ Commands:
     migan     - MI-GAN inpainting
     esrgan    - ESRGAN/Real-ESRGAN upscaling
     clip      - CLIP vision image embedding (writes floats as text)
+    yolox     - YOLOX object detection (writes boxes as text: label score x0 y0 x1 y1)
 
 Options:
     -i, --input <image1> [<image2> ...]  Input image(s)
@@ -129,6 +130,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::esrgan;
     } else if (arg1 == "clip") {
         r.command = cli_command::clip;
+    } else if (arg1 == "yolox") {
+        r.command = cli_command::yolox;
     } else if (arg1 == "-h" || arg1 == "--help") {
         print_usage();
     } else {
@@ -172,6 +175,7 @@ void run_depth_anything(cli_args const&);
 void run_migan(cli_args const&);
 void run_esrgan(cli_args const&);
 void run_clip(cli_args const&);
+void run_yolox(cli_args const&);
 
 } // namespace visp
 
@@ -191,6 +195,7 @@ int main(int argc, char** argv) {
             case cli_command::migan: run_migan(args); break;
             case cli_command::esrgan: run_esrgan(args); break;
             case cli_command::clip: run_clip(args); break;
+            case cli_command::yolox: run_yolox(args); break;
             case cli_command::none: break;
         }
 
@@ -655,6 +660,42 @@ void run_esrgan(cli_args const& args) {
     image_data output_u8 = image_f32_to_u8(output_image, image_format::rgba_u8);
     image_save(output_u8, args.output);
     printf("-> output image saved to %s\n", args.output);
+}
+
+void run_yolox(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] = load_model_weights(
+        args, backend, "YOLOX-S-F16.gguf", 0, backend.preferred_layout());
+
+    require_inputs(args.inputs, 1, "<image>");
+    image_data image = image_load(args.inputs[0]);
+    yolox_params params = yolox_detect_params(file);
+    float ratio = 1;
+    image_data input_data = yolox_process_input(image, params, &ratio);
+    printf("- input %d, depth %d, classes %d\n", params.input_size, params.depth, params.num_classes);
+
+    compute_graph graph = compute_graph_init(8192);
+    model_ref m(weights, graph);
+    print_model_flags(m);
+    int const s = params.input_size;
+    tensor input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+    yolox_output output = yolox_detect(m, input, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input, input_data);
+    compute_timed(graph, backend);
+
+    tensor_data raw = transfer_from_backend(output.raw);
+    std::vector<yolox_box> boxes = yolox_decode(raw.as_f32(), params, ratio, 0.3f, 0.45f);
+    FILE* f = fopen(args.output, "w");
+    if (!f) {
+        throw except("Cannot write {}", args.output);
+    }
+    for (auto const& b : boxes) {
+        fprintf(f, "%d %.4f %.1f %.1f %.1f %.1f\n", b.label, b.score, b.box[0], b.box[1], b.box[2], b.box[3]);
+    }
+    fclose(f);
+    printf("-> %d boxes saved to %s\n", int(boxes.size()), args.output);
 }
 
 } // namespace visp

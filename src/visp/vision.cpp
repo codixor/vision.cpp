@@ -18,6 +18,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::esrgan;
     } else if (arch == "clip") {
         return model_family::clip;
+    } else if (arch == "yolox") {
+        return model_family::yolox;
     }
     return model_family::count;
 }
@@ -201,6 +203,34 @@ clip_result clip_compute(clip_model& model, image_view image) {
     r.penultimate.assign(hidden.as_f32().begin(), hidden.as_f32().end());
     r.n_tokens = int(model.output.penultimate->ne[1]);
     return r;
+}
+
+yolox_model yolox_load_model(char const* filepath, backend_device const& dev) {
+    yolox_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = yolox_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    return model;
+}
+
+std::vector<yolox_box> yolox_compute(
+    yolox_model& model, image_view image, float score_thr, float nms_thr) {
+    int const s = model.params.input_size;
+    if (!model.graph) {
+        model.graph = compute_graph_init(8192);
+        model_ref m(model.weights, model.graph);
+        model.input = compute_graph_input(m, GGML_TYPE_F32, {3, s, s, 1});
+        model.output = yolox_detect(m, model.input, model.params);
+        compute_graph_allocate(model.graph, *model.backend);
+    }
+    float ratio = 1;
+    image_data img = yolox_process_input(image, model.params, &ratio);
+    transfer_to_backend(model.input, img);
+    compute(model.graph, *model.backend);
+    tensor_data raw = transfer_from_backend(model.output.raw);
+    return yolox_decode(raw.as_f32(), model.params, ratio, score_thr, nms_thr);
 }
 
 //
