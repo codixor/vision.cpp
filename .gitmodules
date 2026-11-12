@@ -1,3 +1,8 @@
 [submodule "depend/llama"]
 	path = depend/llama
-	url = https://github.com/Acly/llama.cpp.git
+	url = https://github.com/codixor/llama.cpp.git
+	branch = vision-cwhn-barrier
+[submodule "depend/ggml-shared"]
+	path = depend/ggml-shared
+	url = https://github.com/codixor/ggml.git
+	branch = vision-audio
