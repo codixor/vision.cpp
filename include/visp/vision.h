@@ -94,6 +94,7 @@ enum class model_family {
     rtmpose,
     gfpgan,
     rife,
+    raft,
 
     count
 };
@@ -378,6 +379,35 @@ VISP_API image_data rife_process_input(image_view frame);
 VISP_API tensor rife_interpolate(model_ref, tensor frame0, tensor frame1, float t, rife_params const&);
 
 //
+// RAFT - optical flow (torchvision raft_large)
+
+struct raft_model;
+
+struct raft_params {
+    int hidden_size = 128;
+    int corr_levels = 4;
+    int corr_radius = 4;
+    int iterations = 12; // refinement steps (not stored in the model)
+    static constexpr int alignment = 8;
+};
+
+// Dense flow from frame0 to frame1 in pixels: frame0(x, y) ~ frame1(x + u, y + v).
+struct raft_flow_field {
+    i32x2 extent{};
+    std::vector<float> u; // row-major, extent[0] * extent[1]
+    std::vector<float> v;
+};
+
+VISP_API raft_model raft_load_model(char const* filepath, backend_device const&);
+VISP_API raft_flow_field raft_compute(raft_model&, image_view frame0, image_view frame1);
+
+VISP_API raft_params raft_detect_params(model_file const&);
+// Output tensor is WHCN [W, H, 2] (u, v) at the padded input size.
+VISP_API tensor raft_flow(model_ref, tensor frame0, tensor frame1, raft_params const&);
+// Color-wheel visualization (Middlebury convention); max_flow <= 0 normalizes by the largest motion.
+VISP_API image_data raft_flow_to_image(raft_flow_field const&, float max_flow = 0.f);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -536,6 +566,19 @@ struct rife_model {
     compute_graph graph;
     i32x2 extent{};
     float t = -1.f;
+    tensor input0 = nullptr;
+    tensor input1 = nullptr;
+    tensor output = nullptr;
+};
+
+// internal
+struct raft_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    raft_params params;
+
+    compute_graph graph;
+    i32x2 extent{};
     tensor input0 = nullptr;
     tensor input1 = nullptr;
     tensor output = nullptr;

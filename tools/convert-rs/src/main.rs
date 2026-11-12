@@ -439,12 +439,77 @@ fn convert_rife(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> 
     Ok(())
 }
 
+fn convert_raft(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> Result<()> {
+    // torchvision RAFT (BSD-3-Clause). Batch norms (context encoder) are fused into the
+    // preceding convolutions; instance norms (feature encoder) have no parameters.
+    const EPS: f32 = 1e-5;
+    let small = !model.contains_key("mask_predictor.conv.weight");
+    let hidden = *get(model, "update_block.recurrent_block.convgru1.convz.weight")?.shape.first().ok_or("bad gru")?;
+    g.kv("general.architecture", Value::Str("raft".into()));
+    g.kv("general.file_type", Value::U32(u32::from(f16)));
+    g.kv("raft.tensor_data_layout", Value::Str("whcn".into()));
+    g.kv("raft.hidden_size", Value::I32(i32::try_from(hidden)?));
+    g.kv("raft.corr_levels", Value::I32(4));
+    g.kv("raft.corr_radius", Value::I32(if small { 3 } else { 4 }));
+    println!("raft: {} model, hidden {hidden}", if small { "small" } else { "large" });
+    let mut conv2d = Vec::new();
+    let mut push = |g: &mut Writer, name: &str, shape: Vec<u64>, values: &[f32]| -> Result<()> {
+        let is4 = shape.len() == 4;
+        if is4 {
+            conv2d.push(i32::try_from(g.len())?);
+        }
+        let dtype = if is4 && f16 { DType::F16 } else { DType::F32 };
+        g.tensor(Tensor::from_f32(name, shape, values, dtype))?;
+        Ok(())
+    };
+    for (name, src) in model {
+        if name.ends_with("num_batches_tracked") || name.contains(".running_") {
+            continue;
+        }
+        if let Some(prefix) = name.strip_suffix(".0.weight") {
+            let bn = format!("{prefix}.1.running_mean");
+            if src.shape.len() == 4 && model.contains_key(&bn) {
+                let mean = &get(model, &bn)?.values;
+                let var = &get(model, &format!("{prefix}.1.running_var"))?.values;
+                let gamma = &get(model, &format!("{prefix}.1.weight"))?.values;
+                let beta = &get(model, &format!("{prefix}.1.bias"))?.values;
+                let bias = &get(model, &format!("{prefix}.0.bias"))?.values;
+                let o = src.shape[0] as usize;
+                let per = src.values.len() / o;
+                let mut w = src.values.clone();
+                let mut b = vec![0f32; o];
+                for c in 0..o {
+                    let k = gamma[c] / (var[c] + EPS).sqrt();
+                    w[c * per..(c + 1) * per].iter_mut().for_each(|v| *v *= k);
+                    b[c] = (bias[c] - mean[c]) * k + beta[c];
+                }
+                push(g, name, src.shape.clone(), &w)?;
+                push(g, &format!("{prefix}.0.bias"), vec![o as u64], &b)?;
+                continue;
+            }
+        }
+        if let Some(prefix) = name.strip_suffix(".0.bias") {
+            if model.contains_key(&format!("{prefix}.1.running_mean")) {
+                continue; // written with the fused weight
+            }
+        }
+        if let Some(prefix) = name.strip_suffix(".1.weight").or_else(|| name.strip_suffix(".1.bias")) {
+            if model.contains_key(&format!("{prefix}.1.running_mean")) {
+                continue; // folded batch norm
+            }
+        }
+        push(g, name, src.shape.clone(), &src.values)?;
+    }
+    g.kv("raft.conv2d_weights", Value::I32Array(conv2d));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [arch, input, output] = pos.as_slice() else {
-        return Err("usage: visp-convert <clip|yolox|rtmpose|gfpgan|rife> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
+        return Err("usage: visp-convert <clip|yolox|rtmpose|gfpgan|rife|raft> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
     };
     let model = load(Path::new(input.as_str()))?;
     let mut g = Writer::default();
@@ -454,6 +519,7 @@ fn main() -> Result<()> {
         "rtmpose" => convert_rtmpose(&model, &mut g, !flag("--f32"))?,
         "gfpgan" => convert_gfpgan(&model, &mut g, !flag("--f32"))?,
         "rife" => convert_rife(&model, &mut g, !flag("--f32"))?,
+        "raft" => convert_raft(&model, &mut g, !flag("--f32"))?,
         other => return Err(format!("unknown arch {other}").into()),
     }
     let size = g.write(Path::new(output.as_str()))?;

@@ -1,6 +1,7 @@
 #include "visp/vision.h"
 #include "util/math.h"
 #include "util/string.h"
+#include <cstdlib>
 
 namespace visp {
 
@@ -26,6 +27,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::gfpgan;
     } else if (arch == "rife") {
         return model_family::rife;
+    } else if (arch == "raft") {
+        return model_family::raft;
     }
     return model_family::count;
 }
@@ -361,6 +364,117 @@ image_data rife_compute(rife_model& model, image_view frame0, image_view frame1,
                     crop.data.get() + size_t(y) * frame0.extent[0] * 4);
     }
     return crop;
+}
+
+//
+// RAFT
+
+raft_model raft_load_model(char const* filepath, backend_device const& dev) {
+    raft_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = raft_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), tensor_data_layout::whcn);
+    return model;
+}
+
+raft_flow_field raft_compute(raft_model& model, image_view frame0, image_view frame1) {
+    if (frame0.extent != frame1.extent) {
+        throw except("RAFT: frames must have the same size");
+    }
+    int const a = raft_params::alignment;
+    i32x2 const size{std::max(128, (frame0.extent[0] + a - 1) / a * a),
+                     std::max(128, (frame0.extent[1] + a - 1) / a * a)};
+    auto prepare = [&](image_view frame) {
+        image_data f = image_u8_to_f32(frame, image_format::rgb_f32);
+        if (size == frame.extent) {
+            return f;
+        }
+        image_data out = image_alloc(size, image_format::rgb_f32);
+        image_clear(out);
+        float const* src = image_view(f).as_floats().data();
+        float* dst = image_span(out).as_floats().data();
+        for (int y = 0; y < frame.extent[1]; ++y) {
+            std::copy_n(src + size_t(y) * frame.extent[0] * 3, size_t(frame.extent[0]) * 3,
+                        dst + size_t(y) * size[0] * 3);
+        }
+        return out;
+    };
+    image_data in0 = prepare(frame0);
+    image_data in1 = prepare(frame1);
+    if (!model.graph || model.extent != size) {
+        model.graph = compute_graph_init(16384);
+        model_ref m(model.weights, model.graph);
+        model.input0 = compute_graph_input(m, GGML_TYPE_F32, {3, size[0], size[1], 1});
+        model.input1 = compute_graph_input(m, GGML_TYPE_F32, {3, size[0], size[1], 1});
+        model.output = raft_flow(m, model.input0, model.input1, model.params);
+        compute_graph_allocate(model.graph, *model.backend);
+        model.extent = size;
+    }
+    transfer_to_backend(model.input0, in0);
+    transfer_to_backend(model.input1, in1);
+    compute(model.graph, *model.backend);
+    std::vector<float> planes(size_t(size[0]) * size[1] * 2);
+    transfer_from_backend(model.output, span<float>(planes.data(), planes.size()));
+
+    raft_flow_field field;
+    field.extent = frame0.extent;
+    size_t const n = size_t(frame0.extent[0]) * frame0.extent[1];
+    field.u.resize(n);
+    field.v.resize(n);
+    size_t const plane = size_t(size[0]) * size[1];
+    for (int y = 0; y < frame0.extent[1]; ++y) {
+        for (int x = 0; x < frame0.extent[0]; ++x) {
+            size_t i = size_t(y) * size[0] + x, o = size_t(y) * frame0.extent[0] + x;
+            field.u[o] = planes[i];
+            field.v[o] = planes[plane + i];
+        }
+    }
+    return field;
+}
+
+image_data raft_flow_to_image(raft_flow_field const& f, float max_flow) {
+    // Baker et al. color wheel (RY 15, YG 6, GC 4, CB 11, BM 13, MR 6)
+    std::vector<std::array<float, 3>> wheel;
+    auto ramp = [&](int n, std::array<float, 3> a, std::array<float, 3> b) {
+        for (int i = 0; i < n; ++i) {
+            float t = float(i) / float(n);
+            wheel.push_back({a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t});
+        }
+    };
+    ramp(15, {255, 0, 0}, {255, 255, 0});
+    ramp(6, {255, 255, 0}, {0, 255, 0});
+    ramp(4, {0, 255, 0}, {0, 255, 255});
+    ramp(11, {0, 255, 255}, {0, 0, 255});
+    ramp(13, {0, 0, 255}, {255, 0, 255});
+    ramp(6, {255, 0, 255}, {255, 0, 0});
+    int const ncols = int(wheel.size());
+
+    size_t const n = f.u.size();
+    if (max_flow <= 0.f) {
+        for (size_t i = 0; i < n; ++i) {
+            max_flow = std::max(max_flow, std::sqrt(f.u[i] * f.u[i] + f.v[i] * f.v[i]));
+        }
+        max_flow = std::max(max_flow, 1e-5f);
+    }
+    image_data out = image_alloc(f.extent, image_format::rgba_u8);
+    uint8_t* px = out.data.get();
+    for (size_t i = 0; i < n; ++i) {
+        float u = f.u[i] / max_flow, v = f.v[i] / max_flow;
+        float rad = std::min(1.f, std::sqrt(u * u + v * v));
+        float a = std::atan2(-v, -u) / 3.14159265f;
+        float fk = (a + 1.f) / 2.f * float(ncols - 1);
+        int k0 = int(std::floor(fk)), k1 = (k0 + 1) % ncols;
+        float t = fk - float(k0);
+        for (int c = 0; c < 3; ++c) {
+            float col = ((1.f - t) * wheel[k0][c] + t * wheel[k1][c]) / 255.f;
+            col = 1.f - rad * (1.f - col);
+            px[i * 4 + c] = uint8_t(std::lround(255.f * col));
+        }
+        px[i * 4 + 3] = 255;
+    }
+    return out;
 }
 
 //

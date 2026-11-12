@@ -7,6 +7,7 @@ target_sources(visioncpp PRIVATE
   arch/rtmpose.cpp
   arch/gfpgan.cpp
   arch/rife.cpp
+  arch/raft.cpp
   arch/depth-anything.cpp
   arch/dino.cpp
   arch/esrgan.cpp

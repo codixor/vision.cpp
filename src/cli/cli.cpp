@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose, gfpgan, rife };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose, gfpgan, rife, flow };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -45,6 +45,7 @@ Commands:
     yolox     - YOLOX object detection (writes boxes as text: label score x0 y0 x1 y1)
     gfpgan    - GFPGAN face restoration of an aligned face crop (writes an image)
     rife      - RIFE frame interpolation between two frames -i a b [-p t=0.5] (writes an image)
+    flow      - RAFT optical flow from frame a to b -i a b [-p iterations=12] (.flo or color image)
     pose      - RTMPose/DWPose keypoints for a person box -p x0 y0 x1 y1 (writes x y score)
 
 Options:
@@ -139,6 +140,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::gfpgan;
     } else if (arg1 == "rife") {
         r.command = cli_command::rife;
+    } else if (arg1 == "flow" || arg1 == "raft") {
+        r.command = cli_command::flow;
     } else if (arg1 == "pose" || arg1 == "rtmpose") {
         r.command = cli_command::pose;
     } else if (arg1 == "-h" || arg1 == "--help") {
@@ -188,6 +191,7 @@ void run_yolox(cli_args const&);
 void run_pose(cli_args const&);
 void run_gfpgan(cli_args const&);
 void run_rife(cli_args const&);
+void run_flow(cli_args const&);
 
 } // namespace visp
 
@@ -211,6 +215,7 @@ int main(int argc, char** argv) {
             case cli_command::pose: run_pose(args); break;
             case cli_command::gfpgan: run_gfpgan(args); break;
             case cli_command::rife: run_rife(args); break;
+            case cli_command::flow: run_flow(args); break;
             case cli_command::none: break;
         }
 
@@ -829,6 +834,52 @@ void run_rife(cli_args const& args) {
     }
     image_save(crop, args.output);
     printf("-> output image saved to %s\n", args.output);
+}
+
+void run_flow(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    char const* path = args.model ? args.model : "models/RAFT-L-F16.gguf";
+    raft_model model = raft_load_model(path, backend);
+    if (!args.prompt.empty()) {
+        model.params.iterations = std::max(1, int(std::strtol(args.prompt[0], nullptr, 10)));
+    }
+    require_inputs(args.inputs, 2, "<frame0> <frame1>");
+    image_data frame0 = image_load(args.inputs[0]);
+    image_data frame1 = image_load(args.inputs[1]);
+    printf("- frames %dx%d, %d iterations\n", frame0.extent[0], frame0.extent[1],
+           model.params.iterations);
+    raft_flow_field flow;
+    for (int run = 0; run < 2; ++run) {
+        timer t;
+        flow = raft_compute(model, frame0, frame1);
+        printf("%s (%s)\n", run == 0 ? "Running inference... complete" : "Second run... complete",
+               t.elapsed_str());
+    }
+    double sum = 0;
+    for (size_t i = 0; i < flow.u.size(); ++i) {
+        sum += std::sqrt(double(flow.u[i]) * flow.u[i] + double(flow.v[i]) * flow.v[i]);
+    }
+    printf("- mean motion %.3f px\n", sum / double(flow.u.size()));
+
+    std::string_view out = args.output;
+    if (out.size() > 4 && out.substr(out.size() - 4) == ".flo") {
+        FILE* f = std::fopen(args.output, "wb");
+        if (!f) {
+            throw except("Failed to open {}", args.output);
+        }
+        float const tag = 202021.25f;
+        int32_t const wh[2] = {flow.extent[0], flow.extent[1]};
+        std::fwrite(&tag, 4, 1, f);
+        std::fwrite(wh, 4, 2, f);
+        for (size_t i = 0; i < flow.u.size(); ++i) {
+            float uv[2] = {flow.u[i], flow.v[i]};
+            std::fwrite(uv, 4, 2, f);
+        }
+        std::fclose(f);
+    } else {
+        image_save(raft_flow_to_image(flow), args.output);
+    }
+    printf("-> flow saved to %s\n", args.output);
 }
 
 } // namespace visp
