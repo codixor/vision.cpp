@@ -93,6 +93,7 @@ enum class model_family {
     yolox,
     rtmpose,
     gfpgan,
+    rife,
 
     count
 };
@@ -355,6 +356,28 @@ VISP_API gfpgan_params gfpgan_detect_params(model_file const&);
 VISP_API tensor gfpgan_restore(model_ref, tensor image, gfpgan_params const&);
 
 //
+// RIFE - video frame interpolation (Practical-RIFE IFNet v4.2x)
+
+struct rife_model;
+
+struct rife_params {
+    int num_blocks = 5;       // flow refinement levels (1/16 .. 1/1)
+    int feature_channels = 4; // encoder output channels per frame
+    static constexpr int alignment = 64; // input sizes are padded to a multiple of this
+};
+
+// Loads a RIFE model; the weights are kept in WHCN layout (bilinear resampling, warping).
+VISP_API rife_model rife_load_model(char const* filepath, backend_device const&);
+
+// Synthesizes the frame at time t in (0, 1) between frame0 and frame1 (same size). Returns rgba_u8.
+VISP_API image_data rife_compute(rife_model&, image_view frame0, image_view frame1, float t = 0.5f);
+
+VISP_API rife_params rife_detect_params(model_file const&);
+// Converts to rgb_f32 and zero-pads to a multiple of rife_params::alignment (bottom/right).
+VISP_API image_data rife_process_input(image_view frame);
+VISP_API tensor rife_interpolate(model_ref, tensor frame0, tensor frame1, float t, rife_params const&);
+
+//
 // Depth Anything - depth estimation
 
 struct depthany_model;
@@ -501,6 +524,20 @@ struct gfpgan_model {
 
     compute_graph graph;
     tensor input = nullptr;
+    tensor output = nullptr;
+};
+
+// internal
+struct rife_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    rife_params params;
+
+    compute_graph graph;
+    i32x2 extent{};
+    float t = -1.f;
+    tensor input0 = nullptr;
+    tensor input1 = nullptr;
     tensor output = nullptr;
 };
 

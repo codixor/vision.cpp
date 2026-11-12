@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose, gfpgan };
+enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan, clip, yolox, pose, gfpgan, rife };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -44,6 +44,7 @@ Commands:
     clip      - CLIP vision image embedding (writes floats as text)
     yolox     - YOLOX object detection (writes boxes as text: label score x0 y0 x1 y1)
     gfpgan    - GFPGAN face restoration of an aligned face crop (writes an image)
+    rife      - RIFE frame interpolation between two frames -i a b [-p t=0.5] (writes an image)
     pose      - RTMPose/DWPose keypoints for a person box -p x0 y0 x1 y1 (writes x y score)
 
 Options:
@@ -136,6 +137,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::yolox;
     } else if (arg1 == "gfpgan") {
         r.command = cli_command::gfpgan;
+    } else if (arg1 == "rife") {
+        r.command = cli_command::rife;
     } else if (arg1 == "pose" || arg1 == "rtmpose") {
         r.command = cli_command::pose;
     } else if (arg1 == "-h" || arg1 == "--help") {
@@ -184,6 +187,7 @@ void run_clip(cli_args const&);
 void run_yolox(cli_args const&);
 void run_pose(cli_args const&);
 void run_gfpgan(cli_args const&);
+void run_rife(cli_args const&);
 
 } // namespace visp
 
@@ -206,6 +210,7 @@ int main(int argc, char** argv) {
             case cli_command::yolox: run_yolox(args); break;
             case cli_command::pose: run_pose(args); break;
             case cli_command::gfpgan: run_gfpgan(args); break;
+            case cli_command::rife: run_rife(args); break;
             case cli_command::none: break;
         }
 
@@ -778,6 +783,51 @@ void run_gfpgan(cli_args const& args) {
     image_data out = image_alloc({s, s}, image_format::rgb_f32);
     transfer_from_backend(output, out);
     image_save(image_f32_to_u8(out, image_format::rgba_u8), args.output);
+    printf("-> output image saved to %s\n", args.output);
+}
+
+void run_rife(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] =
+        load_model_weights(args, backend, "RIFE-4.25-F16.gguf", 0, tensor_data_layout::whcn);
+    rife_params params = rife_detect_params(file);
+    float t = args.prompt.empty() ? 0.5f : std::strtof(args.prompt[0], nullptr);
+    if (!(t > 0.f && t < 1.f)) {
+        throw except("RIFE: timestep must be in (0, 1), got {}", t);
+    }
+    require_inputs(args.inputs, 2, "<frame0> <frame1>");
+    image_data frame0 = image_load(args.inputs[0]);
+    image_data frame1 = image_load(args.inputs[1]);
+    if (frame0.extent != frame1.extent) {
+        throw except("RIFE: frames must have the same size");
+    }
+    image_data in0 = rife_process_input(frame0);
+    image_data in1 = rife_process_input(frame1);
+    i32x2 const size = in0.extent;
+    printf("- frames %dx%d (padded %dx%d), t = %.3f\n", frame0.extent[0], frame0.extent[1], size[0],
+           size[1], t);
+
+    compute_graph graph = compute_graph_init(8192);
+    model_ref m(weights, graph);
+    print_model_flags(m);
+    tensor input0 = compute_graph_input(m, GGML_TYPE_F32, {3, size[0], size[1], 1});
+    tensor input1 = compute_graph_input(m, GGML_TYPE_F32, {3, size[0], size[1], 1});
+    tensor output = rife_interpolate(m, input0, input1, t, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input0, in0);
+    transfer_to_backend(input1, in1);
+    compute_timed(graph, backend);
+
+    image_data out = image_alloc(size, image_format::rgb_f32);
+    transfer_from_backend(output, out);
+    image_data u8 = image_f32_to_u8(out, image_format::rgba_u8);
+    image_data crop = image_alloc(frame0.extent, image_format::rgba_u8);
+    for (int y = 0; y < frame0.extent[1]; ++y) {
+        std::copy_n(u8.data.get() + size_t(y) * size[0] * 4, size_t(frame0.extent[0]) * 4,
+                    crop.data.get() + size_t(y) * frame0.extent[0] * 4);
+    }
+    image_save(crop, args.output);
     printf("-> output image saved to %s\n", args.output);
 }
 

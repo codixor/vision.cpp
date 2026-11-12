@@ -402,12 +402,49 @@ fn convert_gfpgan(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -
     Ok(())
 }
 
+fn convert_rife(model: &BTreeMap<String, Source>, g: &mut Writer, f16: bool) -> Result<()> {
+    // Practical-RIFE IFNet v4.2x (MIT). Drops the training-only teacher/caltime branches.
+    let blocks = (0..)
+        .take_while(|i| model.contains_key(&format!("module.block{i}.conv0.0.0.weight")) || model.contains_key(&format!("block{i}.conv0.0.0.weight")))
+        .count();
+    let strip = |n: &str| n.strip_prefix("module.").unwrap_or(n).to_string();
+    let feat = *get(model, &if model.contains_key("module.encode.cnn3.weight") { "module.encode.cnn3.weight".to_string() } else { "encode.cnn3.weight".to_string() })?
+        .shape.get(1).ok_or("bad encode")?;
+    g.kv("general.architecture", Value::Str("rife".into()));
+    g.kv("general.file_type", Value::U32(u32::from(f16)));
+    g.kv("rife.tensor_data_layout", Value::Str("whcn".into()));
+    g.kv("rife.num_blocks", Value::I32(i32::try_from(blocks)?));
+    g.kv("rife.feature_channels", Value::I32(i32::try_from(feat)?));
+    println!("rife: {blocks} blocks, encoder features {feat}");
+    let mut conv2d = Vec::new();
+    for (name, src) in model {
+        let name = strip(name);
+        if name.starts_with("teacher.") || name.starts_with("caltime.") {
+            continue;
+        }
+        if name.ends_with(".beta") {
+            let c = *src.shape.get(1).ok_or("bad beta")?;
+            g.tensor(Tensor::from_f32(&name, vec![c], &src.values, DType::F32))?;
+            continue;
+        }
+        let is4 = src.shape.len() == 4;
+        let transposed = name.contains("lastconv") || name.starts_with("encode.cnn3");
+        if is4 && !transposed {
+            conv2d.push(i32::try_from(g.len())?);
+        }
+        let dtype = if is4 && f16 { DType::F16 } else { DType::F32 };
+        g.tensor(Tensor::from_f32(&name, src.shape.clone(), &src.values, dtype))?;
+    }
+    g.kv("rife.conv2d_weights", Value::I32Array(conv2d));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [arch, input, output] = pos.as_slice() else {
-        return Err("usage: visp-convert <clip|yolox|rtmpose|gfpgan> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
+        return Err("usage: visp-convert <clip|yolox|rtmpose|gfpgan|rife> <input.safetensors> <output.gguf> [--f32] [--quick-gelu]".into());
     };
     let model = load(Path::new(input.as_str()))?;
     let mut g = Writer::default();
@@ -416,6 +453,7 @@ fn main() -> Result<()> {
         "yolox" => convert_yolox(&model, &mut g, !flag("--f32"))?,
         "rtmpose" => convert_rtmpose(&model, &mut g, !flag("--f32"))?,
         "gfpgan" => convert_gfpgan(&model, &mut g, !flag("--f32"))?,
+        "rife" => convert_rife(&model, &mut g, !flag("--f32"))?,
         other => return Err(format!("unknown arch {other}").into()),
     }
     let size = g.write(Path::new(output.as_str()))?;

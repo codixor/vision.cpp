@@ -24,6 +24,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::rtmpose;
     } else if (arch == "gfpgan") {
         return model_family::gfpgan;
+    } else if (arch == "rife") {
+        return model_family::rife;
     }
     return model_family::count;
 }
@@ -295,6 +297,70 @@ image_data gfpgan_compute(gfpgan_model& model, image_view face) {
     image_data output = image_alloc({s, s}, image_format::rgb_f32);
     transfer_from_backend(model.output, output);
     return image_f32_to_u8(output, image_format::rgba_u8);
+}
+
+//
+// RIFE
+
+rife_model rife_load_model(char const* filepath, backend_device const& dev) {
+    rife_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = rife_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), tensor_data_layout::whcn);
+    return model;
+}
+
+image_data rife_process_input(image_view frame) {
+    int const a = rife_params::alignment;
+    i32x2 padded{(frame.extent[0] + a - 1) / a * a, (frame.extent[1] + a - 1) / a * a};
+    image_data f = image_u8_to_f32(frame, image_format::rgb_f32);
+    if (padded == frame.extent) {
+        return f;
+    }
+    image_data out = image_alloc(padded, image_format::rgb_f32);
+    image_clear(out);
+    float const* src = image_view(f).as_floats().data();
+    float* dst = image_span(out).as_floats().data();
+    for (int y = 0; y < frame.extent[1]; ++y) {
+        std::copy_n(src + size_t(y) * frame.extent[0] * 3, size_t(frame.extent[0]) * 3,
+                    dst + size_t(y) * padded[0] * 3);
+    }
+    return out;
+}
+
+image_data rife_compute(rife_model& model, image_view frame0, image_view frame1, float t) {
+    if (frame0.extent != frame1.extent) {
+        throw except("RIFE: frames must have the same size");
+    }
+    image_data in0 = rife_process_input(frame0);
+    image_data in1 = rife_process_input(frame1);
+    if (!model.graph || model.extent != in0.extent || model.t != t) {
+        model.graph = compute_graph_init(8192);
+        model_ref m(model.weights, model.graph);
+        model.input0 = compute_graph_input(m, GGML_TYPE_F32, {3, in0.extent[0], in0.extent[1], 1});
+        model.input1 = compute_graph_input(m, GGML_TYPE_F32, {3, in0.extent[0], in0.extent[1], 1});
+        model.output = rife_interpolate(m, model.input0, model.input1, t, model.params);
+        compute_graph_allocate(model.graph, *model.backend);
+        model.extent = in0.extent;
+        model.t = t;
+    }
+    transfer_to_backend(model.input0, in0);
+    transfer_to_backend(model.input1, in1);
+    compute(model.graph, *model.backend);
+    image_data out = image_alloc(in0.extent, image_format::rgb_f32);
+    transfer_from_backend(model.output, out);
+    image_data u8 = image_f32_to_u8(out, image_format::rgba_u8);
+    if (u8.extent == frame0.extent) {
+        return u8;
+    }
+    image_data crop = image_alloc(frame0.extent, image_format::rgba_u8);
+    for (int y = 0; y < frame0.extent[1]; ++y) {
+        std::copy_n(u8.data.get() + size_t(y) * u8.extent[0] * 4, size_t(frame0.extent[0]) * 4,
+                    crop.data.get() + size_t(y) * frame0.extent[0] * 4);
+    }
+    return crop;
 }
 
 //
